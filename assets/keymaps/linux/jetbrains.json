@@ -148,7 +148,7 @@
       "alt-6": "diagnostics::Deploy",
       "alt-7": "outline_panel::ToggleFocus",
       "alt-8": null, // Services (bottom dock)
-      "alt-9": null, // Git History (bottom dock)
+      "alt-9": "git_graph::ToggleFocus", // Git History (bottom dock)
       "alt-0": "git_panel::ToggleFocus",
     },
   },

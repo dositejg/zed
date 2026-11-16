@@ -1158,6 +1158,22 @@ impl GitRepository for FakeGitRepository {
         })
     }
 
+    fn merge(&self, _branch: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn rebase(&self, _branch: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn outgoing_commits(
+        &self,
+        _branch: String,
+        _upstream: Option<String>,
+    ) -> BoxFuture<'_, Result<Vec<git::repository::CommitSummary>>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
     fn blame(
         &self,
         path: RepoPath,

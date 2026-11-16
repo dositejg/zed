@@ -69,6 +69,8 @@ use workspace::{
     item::{Item, ItemEvent, TabTooltipContent},
 };
 
+pub mod jetbrains;
+
 const COMMIT_CIRCLE_RADIUS: Pixels = px(4.5);
 const COMMIT_CIRCLE_STROKE_WIDTH: Pixels = px(1.5);
 const COMMIT_CIRCLE_HALO_WIDTH: Pixels = px(2.0);
@@ -602,6 +604,8 @@ actions!(
         ScrollDown,
         /// Toggles the selected commit's changed files between flat and tree views.
         ToggleChangedFilesView,
+        /// Toggles focus on the JetBrains Git bottom dock panel.
+        ToggleFocus,
     ]
 );
 
@@ -1231,6 +1235,17 @@ pub fn open_or_reuse_graph(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    if crate::git_panel_settings::GitPanelSettings::get_global(cx).layout
+        == settings::GitPanelLayout::Jetbrains
+        && let Some(dock) = workspace.panel::<jetbrains::JetBrainsGitDock>(cx)
+    {
+        workspace.focus_panel::<jetbrains::JetBrainsGitDock>(window, cx);
+        dock.update(cx, |dock, cx| {
+            dock.open_graph(repo_id, git_store, log_source, sha, window, cx);
+        });
+        return;
+    }
+
     let existing = workspace.items_of_type::<GitGraph>(cx).find(|graph| {
         let graph = graph.read(cx);
         graph.repo_id == repo_id && graph.log_source == log_source
@@ -1494,6 +1509,7 @@ pub struct GitGraph {
     changed_files_expanded_dirs: HashMap<RepoPath, bool>,
     pending_select_sha: Option<Oid>,
     nav_history: Option<ItemNavHistory>,
+    jetbrains: Option<jetbrains::JetBrainsGraphState>,
 }
 
 impl GitGraph {
@@ -1648,6 +1664,16 @@ impl GitGraph {
                     }
                 }
             }
+            GitStoreEvent::ActiveRepositoryChanged(Some(new_repo_id)) => {
+                if this
+                    .jetbrains
+                    .as_ref()
+                    .is_some_and(|jb| jb.follow_active_repo)
+                    && *new_repo_id != this.repo_id
+                {
+                    this.on_jetbrains_active_repository_changed(*new_repo_id, cx);
+                }
+            }
             _ => {}
         })
         .detach();
@@ -1766,6 +1792,7 @@ impl GitGraph {
             changed_files_expanded_dirs: HashMap::default(),
             pending_select_sha: None,
             nav_history: None,
+            jetbrains: None,
         };
 
         this.fetch_initial_graph_data(cx);
@@ -1801,6 +1828,9 @@ impl GitGraph {
                             AllCommitCount::NotLoaded => 0,
                         };
                         self.graph_data.max_commit_count = AllCommitCount::FullyLoaded(count);
+                        if self.jetbrains.is_some() {
+                            self.on_jetbrains_commits_updated(cx);
+                        }
                         cx.notify();
                     }
                     GitGraphEvent::LoadingError => {
@@ -1840,6 +1870,9 @@ impl GitGraph {
                             self.pending_select_sha.take();
                         }
 
+                        if self.jetbrains.is_some() {
+                            self.on_jetbrains_commits_updated(cx);
+                        }
                         cx.notify();
                     }
                 }
@@ -1855,6 +1888,9 @@ impl GitGraph {
                 if repository.read(cx).scan_id > 1 {
                     self.pending_select_sha = None;
                     self.invalidate_state(cx);
+                    if self.jetbrains.is_some() {
+                        self.reload_jetbrains_repo_metadata(cx);
+                    }
                 }
             }
             RepositoryEvent::StashEntriesChanged if self.log_source == LogSource::All => {
@@ -2063,7 +2099,8 @@ impl GitGraph {
         }
 
         range
-            .map(|idx| {
+            .map(|row_idx| {
+                let idx = self.jetbrains_commit_index(row_idx);
                 let Some((commit, repository)) =
                     self.graph_data.commits.get(idx).zip(repository.as_ref())
                 else {
@@ -2147,11 +2184,60 @@ impl GitGraph {
                     column_label(subject)
                 };
 
+                let inline_ref_chips = if self.jetbrains.is_some()
+                    && !self.is_path_history()
+                    && !commit.data.ref_names.is_empty()
+                {
+                    let head_branch_name: Option<SharedString> = repository
+                        .read(cx)
+                        .branch
+                        .as_ref()
+                        .map(|branch| SharedString::from(branch.name().to_string()));
+                    let accent_colors = cx.theme().accents();
+                    let accent_color = accent_colors
+                        .0
+                        .get(commit.color_idx)
+                        .copied()
+                        .unwrap_or_else(|| accent_colors.0.first().copied().unwrap_or_default());
+                    let background = cx.theme().colors().editor_background;
+                    let ref_names = &commit.data.ref_names;
+                    let mut chips = Vec::new();
+                    for name in ref_names.iter().take(2) {
+                        let is_head = Self::is_head_ref(name.as_ref(), &head_branch_name);
+                        chips.push(self.render_ref_chip(
+                            name.clone(),
+                            accent_color,
+                            is_head,
+                            idx,
+                            background,
+                            cx,
+                        ));
+                    }
+                    if ref_names.len() > 2 {
+                        let hidden_refs = ref_names[2..].to_vec();
+                        chips.push(self.render_ref_count_chip(
+                            hidden_refs,
+                            accent_color,
+                            idx,
+                            cx,
+                        ));
+                    }
+                    chips
+                } else {
+                    Vec::new()
+                };
+
                 vec![
                     div()
                         .id(ElementId::NamedInteger("commit-subject".into(), idx as u64))
                         .overflow_hidden()
-                        .child(h_flex().gap_2().overflow_hidden().child(subject_label))
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .overflow_hidden()
+                                .children(inline_ref_chips)
+                                .child(subject_label),
+                        )
                         .into_any_element(),
                     column_label(formatted_time.into()),
                     {
@@ -4381,6 +4467,9 @@ impl GitGraph {
 
 impl Render for GitGraph {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.jetbrains.is_some() {
+            return self.render_jetbrains(window, cx).into_any_element();
+        }
         // This happens when we changed branches, we should refresh our search as well
         if let QueryState::Pending(query) = &mut self.search_state.state {
             let query = std::mem::take(query);
@@ -4780,6 +4869,7 @@ impl Render for GitGraph {
                 window.dispatch_action(Box::new(FocusSearch), cx);
                 cx.stop_propagation();
             }))
+            .into_any_element()
     }
 }
 

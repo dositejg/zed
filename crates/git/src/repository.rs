@@ -865,6 +865,16 @@ pub trait GitRepository: Send + Sync {
         force: bool,
     ) -> BoxFuture<'_, Result<()>>;
 
+    fn merge(&self, branch: String) -> BoxFuture<'_, Result<()>>;
+
+    fn rebase(&self, branch: String) -> BoxFuture<'_, Result<()>>;
+
+    fn outgoing_commits(
+        &self,
+        branch: String,
+        upstream: Option<String>,
+    ) -> BoxFuture<'_, Result<Vec<CommitSummary>>>;
+
     fn worktrees(&self) -> BoxFuture<'_, Result<Vec<Worktree>>>;
 
     /// Returns the creation time of a linked worktree's git metadata
@@ -2490,6 +2500,80 @@ impl GitRepository for RealGitRepository {
                 let flag = delete_branch_flag(is_remote, force);
                 git_binary.run(&["branch", flag, &name]).await?;
                 anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn merge(&self, branch: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                git_binary.run(&["merge", &branch]).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn rebase(&self, branch: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                git_binary.run(&["rebase", &branch]).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn outgoing_commits(
+        &self,
+        branch: String,
+        upstream: Option<String>,
+    ) -> BoxFuture<'_, Result<Vec<CommitSummary>>> {
+        let git = self.git_binary();
+
+        self.executor
+            .spawn(async move {
+                let mut args: Vec<String> = vec![
+                    "log".into(),
+                    "-n".into(),
+                    "100".into(),
+                    "--format=%H%x00%s%x00%ct%x00%an".into(),
+                ];
+                match upstream {
+                    Some(upstream) => {
+                        args.push(format!("{upstream}..{branch}"));
+                    }
+                    None => {
+                        args.push(branch);
+                        args.push("--not".into());
+                        args.push("--remotes".into());
+                    }
+                }
+                let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+                let output = git.run(&args_ref).await?;
+                let commits = output
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .filter_map(|line| {
+                        let mut parts = line.splitn(4, '\0');
+                        let sha = parts.next()?.to_string();
+                        let subject = parts.next()?.to_string();
+                        let timestamp = parts.next()?.parse::<i64>().unwrap_or(0);
+                        let author_name = parts.next().unwrap_or_default().to_string();
+                        Some(CommitSummary {
+                            sha: sha.into(),
+                            subject: subject.into(),
+                            commit_timestamp: timestamp,
+                            author_name: author_name.into(),
+                            has_parent: true,
+                        })
+                    })
+                    .collect();
+                anyhow::Ok(commits)
             })
             .boxed()
     }

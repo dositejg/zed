@@ -108,13 +108,14 @@ pub fn init(cx: &mut App) {
     })
     .detach();
 
-    cx.observe_new(|workspace: &mut Workspace, _, cx| {
+    cx.observe_new(|workspace: &mut Workspace, window, cx| {
         ProjectDiff::register(workspace, cx);
         staged_diff::StagedDiff::register(workspace, cx);
         unstaged_diff::UnstagedDiff::register(workspace, cx);
         branch_diff::BranchDiff::register(workspace, cx);
         CommitModal::register(workspace);
         git_panel::register(workspace);
+        git_graph::jetbrains::register(workspace, window, cx);
         repository_selector::register(workspace);
         git_picker::register(workspace);
 
@@ -449,7 +450,7 @@ pub fn git_status_icon(status: FileStatus) -> impl IntoElement {
     GitStatusIcon::new(status)
 }
 
-struct RenameBranchModal {
+pub(crate) struct RenameBranchModal {
     current_branch: SharedString,
     editor: Entity<Editor>,
     repo: Entity<Repository>,
@@ -457,7 +458,7 @@ struct RenameBranchModal {
 }
 
 impl RenameBranchModal {
-    fn new(
+    pub(crate) fn new(
         current_branch: String,
         repo: Entity<Repository>,
         window: &mut Window,

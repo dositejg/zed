@@ -158,7 +158,7 @@
       "cmd-6": "diagnostics::Deploy",
       "cmd-7": "outline_panel::ToggleFocus",
       "cmd-8": null, // Services (bottom dock)
-      "cmd-9": null, // Git History (bottom dock)
+      "cmd-9": "git_graph::ToggleFocus", // Git History (bottom dock)
       "cmd-0": "git_panel::ToggleFocus",
     },
   },

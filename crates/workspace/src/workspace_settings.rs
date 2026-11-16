@@ -114,7 +114,16 @@ impl Settings for WorkspaceSettings {
                         .unwrap(),
                 ),
             },
-            bottom_dock_layout: workspace.bottom_dock_layout.unwrap(),
+            bottom_dock_layout: if content
+                .git_panel
+                .as_ref()
+                .and_then(|git_panel| git_panel.layout)
+                == Some(settings::GitPanelLayout::Jetbrains)
+            {
+                settings::BottomDockLayout::Full
+            } else {
+                workspace.bottom_dock_layout.unwrap()
+            },
             pane_split_direction_horizontal: workspace.pane_split_direction_horizontal.unwrap(),
             pane_split_direction_vertical: workspace.pane_split_direction_vertical.unwrap(),
             centered_layout: workspace.centered_layout.unwrap(),

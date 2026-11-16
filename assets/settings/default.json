@@ -1090,6 +1090,14 @@
     "date_style": "absolute",
   },
   "git_panel": {
+    // Layout of the git panel.
+    //
+    // Choices: zed, jetbrains
+    // For the WebStorm look with "jetbrains", set:
+    //   "tree_view": true, "file_icons": true,
+    //   "status_style": "label_color", "folder_indicator": "both"
+    // Default: zed
+    "layout": "zed",
     // Show "relative" or "absolute" dates in commit history.
     "date_style": "relative",
     // Whether to show the git panel button in the status bar.

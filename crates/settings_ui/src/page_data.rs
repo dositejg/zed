@@ -6568,9 +6568,23 @@ fn panels_page() -> SettingsPage {
         ]
     }
 
-    fn git_panel_section() -> [SettingsPageItem; 20] {
+    fn git_panel_section() -> [SettingsPageItem; 21] {
         [
             SettingsPageItem::SectionHeader("Git Panel"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Git Panel Layout",
+                description: "Layout of the Git panel.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("git_panel.layout"),
+                    pick: |settings_content| settings_content.git_panel.as_ref()?.layout.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.git_panel.get_or_insert_default().layout = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Date Style",
                 description: "Show relative or absolute dates in commit history.",

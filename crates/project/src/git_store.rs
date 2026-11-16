@@ -10182,6 +10182,55 @@ impl Repository {
         )
     }
 
+    pub fn merge(&mut self, branch: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(
+            "merge",
+            Some(format!("git merge {branch}").into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.merge(branch).await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("merge is not supported for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn rebase(&mut self, branch: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(
+            "rebase",
+            Some(format!("git rebase {branch}").into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.rebase(branch).await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("rebase is not supported for remote repositories")
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn outgoing_commits(
+        &mut self,
+        branch: String,
+        upstream: Option<String>,
+    ) -> oneshot::Receiver<Result<Vec<git::repository::CommitSummary>>> {
+        self.send_job("outgoing_commits", None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.outgoing_commits(branch, upstream).await
+                }
+                RepositoryState::Remote(_) => Ok(Vec::new()),
+            }
+        })
+    }
+
     pub fn check_for_pushed_commits(&mut self) -> oneshot::Receiver<Result<Vec<SharedString>>> {
         let id = self.id;
         self.send_job(

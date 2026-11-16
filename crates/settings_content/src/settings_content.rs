@@ -832,6 +832,11 @@ pub struct GitPanelSettingsContent {
     ///
     /// Default: expanded
     pub commit_editor: Option<GitPanelCommitEditor>,
+
+    /// Layout of the Git panel.
+    ///
+    /// Default: zed
+    pub layout: Option<GitPanelLayout>,
 }
 
 #[with_fallible_options]
@@ -953,6 +958,27 @@ pub enum StatusStyle {
     #[default]
     Icon,
     LabelColor,
+}
+
+#[derive(
+    Default,
+    Copy,
+    Clone,
+    Debug,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GitPanelLayout {
+    #[default]
+    Zed,
+    Jetbrains,
 }
 
 #[with_fallible_options]

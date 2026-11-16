@@ -1,4 +1,5 @@
 mod branch_mode;
+mod jetbrains;
 
 use git_ui_core::askpass_modal::AskPassModal;
 pub(crate) use git_ui_core::notifications::{open_output, show_error_toast};
@@ -648,6 +649,7 @@ struct SerializedCommitMessage {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum GitPanelTab {
     Changes,
+    Stash,
     History,
 }
 
@@ -1375,6 +1377,7 @@ pub struct GitPanel {
     changes_mode: ChangesMode,
     changes_mode_menu_handle: PopoverMenuHandle<ContextMenu>,
     branch_base: BranchBase,
+    jetbrains: jetbrains::JetBrainsState,
     /// Uncommitted files, one per path. Staging, discarding and committing
     /// act on these regardless of which mode `entries` shows.
     change_entries: Vec<GitStatusEntry>,
@@ -1539,6 +1542,7 @@ impl GitPanel {
             let mut was_diff_stats = GitPanelSettings::get_global(cx).diff_stats;
             let mut was_commit_editor = GitPanelSettings::get_global(cx).commit_editor;
             let mut was_date_style = GitPanelSettings::get_global(cx).date_style;
+            let mut was_layout = GitPanelSettings::get_global(cx).layout;
             let mut was_date_format = ProjectSettings::get_global(cx).git.date_format.clone();
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
                 let settings = GitPanelSettings::get_global(cx);
@@ -1550,6 +1554,7 @@ impl GitPanel {
                 let diff_stats = settings.diff_stats;
                 let commit_editor = settings.commit_editor;
                 let date_style = settings.date_style;
+                let layout = settings.layout;
                 let date_format = ProjectSettings::get_global(cx).git.date_format.clone();
                 // Changing the setting is an explicit request, so it wins over
                 // whatever this workspace last persisted.
@@ -1576,9 +1581,17 @@ impl GitPanel {
                 }
 
                 let mut update_entries = false;
-                if sort_by != was_sort_by || group_by != was_group_by || tree_view != was_tree_view
+                if sort_by != was_sort_by
+                    || group_by != was_group_by
+                    || tree_view != was_tree_view
                 {
                     this.bulk_staging.take();
+                    update_entries = true;
+                }
+                if layout != was_layout {
+                    if !this.is_jetbrains_layout(cx) && this.active_tab == GitPanelTab::Stash {
+                        this.set_active_tab(GitPanelTab::Changes, window, cx);
+                    }
                     update_entries = true;
                 }
                 if (diff_stats != was_diff_stats) || update_entries {
@@ -1599,6 +1612,7 @@ impl GitPanel {
                 was_diff_stats = diff_stats;
                 was_commit_editor = commit_editor;
                 was_date_style = date_style;
+                was_layout = layout;
                 was_date_format = date_format;
             })
             .detach();
@@ -1784,6 +1798,7 @@ impl GitPanel {
                 changes_mode: ChangesMode::Uncommitted,
                 changes_mode_menu_handle: PopoverMenuHandle::default(),
                 branch_base: BranchBase::new(),
+                jetbrains: jetbrains::JetBrainsState::default(),
                 change_entries: Vec::new(),
                 change_entry_indices: HashMap::default(),
             };
@@ -2401,6 +2416,7 @@ impl GitPanel {
             dispatch_context.add("menu");
             match self.active_tab {
                 GitPanelTab::Changes => dispatch_context.add("ChangesList"),
+                GitPanelTab::Stash => dispatch_context.add("StashList"),
                 GitPanelTab::History => dispatch_context.add("HistoryList"),
             }
         }
@@ -4341,6 +4357,7 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let push_after_commit = std::mem::take(&mut self.jetbrains.push_after_commit);
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
@@ -4413,6 +4430,7 @@ impl GitPanel {
                 match result {
                     Ok(()) => {
                         this.set_skip_hooks_enabled(false, cx);
+                        this.jetbrains.recent_commit_messages = None;
                         if options.amend {
                             this.set_amend_pending(false, cx);
                         } else {
@@ -4420,6 +4438,16 @@ impl GitPanel {
                                 .update(cx, |editor, cx| editor.clear(window, cx));
                             this.original_commit_message = None;
                             this.serialize(cx);
+                        }
+                        if push_after_commit {
+                            #[cfg(test)]
+                            {
+                                this.jetbrains.push_triggered_count += 1;
+                                if this.jetbrains.skip_actual_push_in_tests {
+                                    return;
+                                }
+                            }
+                            this.push(false, false, window, cx);
                         }
                     }
                     Err(e) => this.show_error_toast("commit", e, cx),
@@ -5861,6 +5889,9 @@ impl GitPanel {
             }
             self.git_access = None;
             self._repo_subscriptions.clear();
+            self.jetbrains.stash_list = None;
+            self.jetbrains.recent_commit_messages = None;
+            self.jetbrains.recent_commit_messages_task = None;
             if self.active_tab == GitPanelTab::History {
                 self.set_commit_history(CommitHistory::Loading, cx);
             }
@@ -5869,6 +5900,9 @@ impl GitPanel {
         if active_repository_changed {
             self.update_active_history_sha(cx);
             self.reset_branch_state(window, cx);
+            if self.active_tab == GitPanelTab::Stash {
+                self.ensure_jetbrains_stash_list(window, cx);
+            }
         }
         self.reopen_commit_buffer(window, cx);
         self.preload_commit_history(cx);
@@ -8035,6 +8069,12 @@ impl GitPanel {
                 self.cancel_pending_branch_changes();
                 self.load_commit_history(cx);
             }
+            GitPanelTab::Stash => {
+                self.cancel_pending_branch_changes();
+                self.set_commit_history(CommitHistory::Loading, cx);
+                self._repo_subscriptions.clear();
+                self.ensure_jetbrains_stash_list(window, cx);
+            }
             GitPanelTab::Changes => {
                 self.set_commit_history(CommitHistory::Loading, cx);
                 self._repo_subscriptions.clear();
@@ -8797,9 +8837,19 @@ impl GitPanel {
                             }),
                         )
                         .when(is_tree_view, |list| {
+                            let (tree_indent, indent_guide_left_offset) =
+                                if self.is_jetbrains_layout(cx) {
+                                    (
+                                        px(jetbrains::JETBRAINS_TREE_INDENT),
+                                        INDENT_GUIDE_LEFT_OFFSET
+                                            + px(jetbrains::JETBRAINS_CHILD_INDENT),
+                                    )
+                                } else {
+                                    (px(TREE_INDENT), INDENT_GUIDE_LEFT_OFFSET)
+                                };
                             list.with_decoration(
-                                ui::indent_guides(px(TREE_INDENT), IndentGuideColors::panel(cx))
-                                    .with_left_offset(INDENT_GUIDE_LEFT_OFFSET)
+                                ui::indent_guides(tree_indent, IndentGuideColors::panel(cx))
+                                    .with_left_offset(indent_guide_left_offset)
                                     .with_compute_indents_fn(
                                         cx.entity(),
                                         |this, range, _window, _cx| {
@@ -8846,9 +8896,12 @@ impl GitPanel {
         ix: usize,
         header: &GitHeaderEntry,
         has_write_access: bool,
-        _window: &Window,
+        window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
+        if self.is_jetbrains_layout(cx) {
+            return self.render_jetbrains_list_header(ix, header, has_write_access, window, cx);
+        }
         let id: ElementId = ElementId::Name(format!("header_{}", ix).into());
         let checkbox_id: ElementId = ElementId::Name(format!("header_{}_checkbox", ix).into());
         let group_name: SharedString = format!("header_{}", ix).into();
@@ -9234,6 +9287,18 @@ impl GitPanel {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
+        if self.is_jetbrains_layout(cx) {
+            return self.render_jetbrains_status_entry(
+                ix,
+                entry,
+                depth,
+                has_write_access,
+                show_checkbox,
+                repo,
+                window,
+                cx,
+            );
+        }
         let settings = GitPanelSettings::get_global(cx);
         let tree_view = settings.tree_view;
         let path_style = self.project.read(cx).path_style(cx);
@@ -9531,6 +9596,16 @@ impl GitPanel {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
+        if self.is_jetbrains_layout(cx) {
+            return self.render_jetbrains_directory_entry(
+                ix,
+                entry,
+                has_write_access,
+                show_checkbox,
+                window,
+                cx,
+            );
+        }
         let selected = self.selected_entry == Some(ix);
         let marked = self.marked_directories.contains(&entry.key);
         let label_color = Color::Muted;
@@ -10100,7 +10175,9 @@ impl Render for GitPanel {
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
-            .child(
+            .child(if self.is_jetbrains_layout(cx) {
+                self.render_jetbrains_body(window, cx).into_any_element()
+            } else {
                 v_flex()
                     .size_full()
                     .when(!self.commit_editor_expanded, |this| {
@@ -10132,10 +10209,13 @@ impl Render for GitPanel {
                             .when(!self.amend_pending, |this| {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
+                        GitPanelTab::Stash => {
+                            this.child(self.render_jetbrains_stash_tab(window, cx))
+                        }
                         GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
                     })
-                    .into_any_element(),
-            )
+                    .into_any_element()
+            })
             .children(self.context_menu.as_ref().map(|context_menu| {
                 deferred(
                     anchored()
@@ -10804,7 +10884,7 @@ mod tests {
 
     use super::*;
 
-    fn init_test(cx: &mut gpui::TestAppContext) {
+    pub(super) fn init_test(cx: &mut gpui::TestAppContext) {
         zlog::init_test();
 
         cx.update(|cx| {
@@ -10884,7 +10964,7 @@ mod tests {
         });
     }
 
-    fn entry_index_for_repo_path(panel: &GitPanel, repo_path: &RepoPath) -> Option<usize> {
+    pub(super) fn entry_index_for_repo_path(panel: &GitPanel, repo_path: &RepoPath) -> Option<usize> {
         panel.entries.iter().position(|entry| {
             entry
                 .status_entry()
@@ -10919,7 +10999,7 @@ mod tests {
             .collect()
     }
 
-    fn directory_index_for_repo_path(panel: &GitPanel, repo_path: &RepoPath) -> Option<usize> {
+    pub(super) fn directory_index_for_repo_path(panel: &GitPanel, repo_path: &RepoPath) -> Option<usize> {
         panel.entries.iter().position(|entry| {
             entry
                 .directory_entry()
@@ -10927,7 +11007,7 @@ mod tests {
         })
     }
 
-    async fn await_git_panel_entries(panel: &Entity<GitPanel>, cx: &mut VisualTestContext) {
+    pub(super) async fn await_git_panel_entries(panel: &Entity<GitPanel>, cx: &mut VisualTestContext) {
         let handle = cx.update_window_entity(panel, |panel, _, _| {
             std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
         });
@@ -10956,7 +11036,7 @@ mod tests {
         });
     }
 
-    async fn setup_git_panel_with_changes(
+    pub(super) async fn setup_git_panel_with_changes(
         cx: &mut TestAppContext,
         tree: serde_json::Value,
         status_entries: &[(&str, git::status::StatusCode)],
