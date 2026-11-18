@@ -722,6 +722,13 @@ impl GitRepository for FakeGitRepository {
         })
     }
 
+    fn branches_containing_commit(
+        &self,
+        _sha: Oid,
+    ) -> BoxFuture<'_, Result<Vec<gpui::SharedString>>> {
+        async { Ok(Vec::new()) }.boxed()
+    }
+
     fn worktrees(&self) -> BoxFuture<'_, Result<Vec<Worktree>>> {
         let fs = self.fs.clone();
         let common_dir_path = self.common_dir_path.clone();

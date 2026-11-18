@@ -9789,6 +9789,24 @@ impl Repository {
         })
     }
 
+    pub fn branches_containing_commit(
+        &mut self,
+        sha: Oid,
+    ) -> oneshot::Receiver<Result<Vec<SharedString>>> {
+        self.send_job(
+            "branches_containing_commit",
+            None,
+            move |repo, _| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.branches_containing_commit(sha).await
+                    }
+                    RepositoryState::Remote(_) => Ok(Vec::new()),
+                }
+            },
+        )
+    }
+
     /// If this is a linked worktree (*NOT* the main checkout of a repository),
     /// returns the path for the linked worktree.
     ///

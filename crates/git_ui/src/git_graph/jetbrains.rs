@@ -2636,7 +2636,27 @@ impl GitGraph {
 
         let full_sha: SharedString = commit_entry.data.sha.to_string().into();
         let short_sha: SharedString = full_sha.chars().take(7).collect::<String>().into();
-        let ref_names = commit_entry.data.ref_names.clone();
+        let mut all_refs = commit_entry.data.ref_names.clone();
+        if let Some((branches_sha, containing_branches)) = self.selected_commit_branches.as_ref()
+            && *branches_sha == commit_entry.data.sha
+        {
+            for branch in containing_branches {
+                let already_present = all_refs.iter().any(|existing| {
+                    existing.as_ref() == branch.as_ref()
+                        || Self::ref_name_from_decoration(existing.as_ref()).as_deref()
+                            == Some(branch.as_ref())
+                });
+                if !already_present {
+                    all_refs.push(branch.clone());
+                }
+            }
+        }
+        const MAX_VISIBLE_COMMIT_BRANCHES: usize = 8;
+        let hidden_refs = if all_refs.len() > MAX_VISIBLE_COMMIT_BRANCHES {
+            all_refs.split_off(MAX_VISIBLE_COMMIT_BRANCHES)
+        } else {
+            Vec::new()
+        };
         let head_branch_name: Option<SharedString> = repository
             .read(cx)
             .branch
@@ -2715,14 +2735,19 @@ impl GitGraph {
             window.use_keyed_state("jb-sha-copy", cx, CopiedState::new);
         let is_copied = copied_state.read(cx).is_copied();
 
+        let message_expanded =
+            !self.commit_details_message_collapsed && self.selected_commit_message.is_some();
+
         v_flex()
             .id("jetbrains-right-pane")
             .size_full()
+            .min_w_0()
             .bg(cx.theme().colors().editor_background)
             .child(
                 v_flex()
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
                     .overflow_hidden()
                     .child(
                         h_flex()
@@ -2884,13 +2909,17 @@ impl GitGraph {
             .child(Divider::horizontal())
             .child(
                 v_flex()
-                    .flex_1()
-                    .min_h_0()
+                    .when(message_expanded, |this| this.flex_1().min_h_0())
+                    .when(!message_expanded, |this| this.flex_none())
+                    .min_w_0()
                     .overflow_hidden()
-                    .child(self.render_commit_message(window, cx))
+                    .child(self.render_commit_message(true, window, cx))
                     .child(Divider::horizontal())
                     .child(
                         h_flex()
+                            .flex_none()
+                            .w_full()
+                            .min_w_0()
                             .px_2()
                             .py_1()
                             .gap_1p5()
@@ -2934,7 +2963,7 @@ impl GitGraph {
                                         .color(Color::Muted),
                                 )
                             })
-                            .children(ref_names.iter().map(|name| {
+                            .children(all_refs.iter().map(|name| {
                                 let is_head =
                                     Self::is_head_ref(name.as_ref(), &head_branch_name);
                                 self.render_ref_chip(
@@ -2946,6 +2975,14 @@ impl GitGraph {
                                     cx,
                                 )
                             }))
+                            .when(!hidden_refs.is_empty(), |this| {
+                                this.child(self.render_ref_count_chip(
+                                    hidden_refs,
+                                    accent_color,
+                                    selected_idx,
+                                    cx,
+                                ))
+                            })
                             .when_some(remote, |this, remote| {
                                 let provider_name = remote.host.name();
                                 let icon = ui::git_hosting_provider_icon(provider_name.as_str());

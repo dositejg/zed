@@ -852,6 +852,7 @@ pub trait GitRepository: Send + Sync {
     }
 
     fn branches(&self) -> BoxFuture<'_, Result<BranchesScanResult>>;
+    fn branches_containing_commit(&self, sha: Oid) -> BoxFuture<'_, Result<Vec<SharedString>>>;
 
     fn change_branch(&self, name: String) -> BoxFuture<'_, Result<()>>;
     fn create_branch(&self, name: String, base_branch: Option<String>)
@@ -2231,6 +2232,66 @@ impl GitRepository for RealGitRepository {
                 }
 
                 Ok(BranchesScanResult { branches, error })
+            })
+            .boxed()
+    }
+
+    fn branches_containing_commit(&self, sha: Oid) -> BoxFuture<'_, Result<Vec<SharedString>>> {
+        let git = self.git_binary();
+        let sha_string = sha.to_string();
+        self.executor
+            .spawn(async move {
+                let args = [
+                    "for-each-ref",
+                    "--contains",
+                    &sha_string,
+                    "--format=%(HEAD)%00%(refname)%00%(refname:short)%00%(symref)",
+                    "refs/heads",
+                    "refs/remotes",
+                ];
+                let output = git.build_command(&args).output().await?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    anyhow::bail!("git for-each-ref --contains failed: {stderr}");
+                }
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut head_branches = Vec::new();
+                let mut local_branches = Vec::new();
+                let mut remote_branches = Vec::new();
+
+                for line in stdout.lines() {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let mut fields = line.split('\x00');
+                    let Some(head) = fields.next() else {
+                        continue;
+                    };
+                    let Some(full_ref) = fields.next() else {
+                        continue;
+                    };
+                    let Some(short_ref) = fields.next() else {
+                        continue;
+                    };
+                    let symref = fields.next().unwrap_or("");
+                    if !symref.is_empty() || short_ref.is_empty() {
+                        continue;
+                    }
+
+                    let name = SharedString::from(short_ref.to_string());
+                    if head == "*" {
+                        head_branches.push(name);
+                    } else if full_ref.starts_with("refs/heads/") {
+                        local_branches.push(name);
+                    } else {
+                        remote_branches.push(name);
+                    }
+                }
+
+                head_branches.extend(local_branches);
+                head_branches.extend(remote_branches);
+                Ok(head_branches)
             })
             .boxed()
     }
@@ -7047,6 +7108,82 @@ mod tests {
             compose_batch_mode_ssh_command(None, None, Some("plink")),
             None,
             "setting GIT_SSH_COMMAND would silently replace the GIT_SSH program"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_branches_containing_commit(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+
+        git_init_repo(&repo_dir);
+
+        let repo = RealGitRepository::new(
+            &repo_dir.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        let git = repo.git_binary();
+        git.run(&["config", "user.name", "Test User"]).await.unwrap();
+        git.run(&["config", "user.email", "test@example.com"])
+            .await
+            .unwrap();
+        git.run(&["checkout", "-b", "main"]).await.unwrap();
+        std::fs::write(repo_dir.join("file.txt"), "base\n").unwrap();
+        git.run(&["add", "file.txt"]).await.unwrap();
+        git.run(&["commit", "-m", "base commit"]).await.unwrap();
+
+        let base_sha_output = git
+            .build_command(&["rev-parse", "HEAD"])
+            .output()
+            .await
+            .unwrap();
+        let base_sha = Oid::from_str(
+            String::from_utf8_lossy(&base_sha_output.stdout).trim(),
+        )
+        .unwrap();
+
+        git.run(&["branch", "feature-b"]).await.unwrap();
+        git.run(&["checkout", "-b", "feature-a"]).await.unwrap();
+        std::fs::write(repo_dir.join("file.txt"), "feature-a\n").unwrap();
+        git.run(&["add", "file.txt"]).await.unwrap();
+        git.run(&["commit", "-m", "feature-a commit"]).await.unwrap();
+
+        let feature_a_sha_output = git
+            .build_command(&["rev-parse", "HEAD"])
+            .output()
+            .await
+            .unwrap();
+        let feature_a_sha = Oid::from_str(
+            String::from_utf8_lossy(&feature_a_sha_output.stdout).trim(),
+        )
+        .unwrap();
+
+        git.run(&["checkout", "main"]).await.unwrap();
+
+        let base_branches = repo.branches_containing_commit(base_sha).await.unwrap();
+        assert_eq!(base_branches.first().map(|s| s.as_ref()), Some("main"));
+        assert!(base_branches.iter().any(|b| b.as_ref() == "feature-a"));
+        assert!(base_branches.iter().any(|b| b.as_ref() == "feature-b"));
+        assert_eq!(base_branches.len(), 3);
+
+        let feature_a_branches = repo
+            .branches_containing_commit(feature_a_sha)
+            .await
+            .unwrap();
+        assert_eq!(
+            feature_a_branches
+                .iter()
+                .map(|b| b.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["feature-a"]
         );
     }
 }

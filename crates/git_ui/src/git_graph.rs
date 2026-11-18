@@ -1500,6 +1500,8 @@ pub struct GitGraph {
     _commit_diff_task: Option<Task<()>>,
     selected_commit_message: Option<DetailPanelCommitMessage>,
     _selected_commit_message_task: Option<Task<()>>,
+    selected_commit_branches: Option<(Oid, Vec<SharedString>)>,
+    _selected_commit_branches_task: Option<Task<()>>,
     commit_details_split_state: Entity<SplitState>,
     repo_id: RepositoryId,
     changed_files_scroll_handle: UniformListScrollHandle,
@@ -1519,6 +1521,8 @@ impl GitGraph {
         self.search_state.selected_index = None;
         self.search_state.state.next_state();
         self.context_menu = None;
+        self.selected_commit_branches = None;
+        self._selected_commit_branches_task = None;
         cx.emit(ItemEvent::Edit);
         cx.notify();
     }
@@ -1781,6 +1785,8 @@ impl GitGraph {
             selected_commit_diff_stats: None,
             selected_commit_message: None,
             _selected_commit_message_task: None,
+            selected_commit_branches: None,
+            _selected_commit_branches_task: None,
             log_source,
             log_order,
             commit_details_split_state: cx.new(|_cx| SplitState::new()),
@@ -2488,6 +2494,9 @@ impl GitGraph {
         let diff_handle = commit.data.sha.to_string();
 
         self.load_selected_commit_message(cx, &commit_message_handle, &repository);
+        if self.jetbrains.is_some() {
+            self.load_selected_commit_branches(cx, commit_message_handle, &repository);
+        }
 
         let diff_task =
             repository.update(cx, |repo, cx| repo.load_commit_diff(diff_handle, false, cx));
@@ -2570,6 +2579,33 @@ impl GitGraph {
         });
         self._selected_commit_message_task = None;
         cx.notify();
+    }
+
+    fn load_selected_commit_branches(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+        sha: Oid,
+        repository: &Entity<Repository>,
+    ) {
+        if self
+            .selected_commit_branches
+            .as_ref()
+            .is_some_and(|(loaded_sha, _)| *loaded_sha == sha)
+        {
+            return;
+        }
+
+        self.selected_commit_branches = None;
+        let branches_rx = repository.update(cx, |repo, _| repo.branches_containing_commit(sha));
+        self._selected_commit_branches_task = Some(cx.spawn(async move |this, cx| {
+            if let Ok(Ok(branches)) = branches_rx.await {
+                this.update(cx, |this, cx| {
+                    this.selected_commit_branches = Some((sha, branches));
+                    cx.notify();
+                })
+                .log_err();
+            }
+        }));
     }
 
     fn select_previous_match(&mut self, cx: &mut Context<Self>) {
@@ -3518,7 +3554,7 @@ impl GitGraph {
                     }),
             )
             .child(Divider::horizontal())
-            .child(self.render_commit_message(window, cx))
+            .child(self.render_commit_message(false, window, cx))
             .child(Divider::horizontal())
             .child(
                 v_flex()
@@ -4384,6 +4420,7 @@ impl GitGraph {
 
     fn render_commit_message(
         &self,
+        fill_height: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -4404,21 +4441,17 @@ impl GitGraph {
 
         let collapsed = self.commit_details_message_collapsed;
 
-        div()
-            // Using grid over flexbox because the structure of this side
-            // panel prvents taffy from calculating a concrete width correctly,
-            // which causes problems with text reflow when using flexbox.
-            // grid, on the other hand, doesn't appear to give taffy the same
-            // problems.
+        v_flex()
             .w_full()
+            .min_w_0()
             .py_2()
             .pl_2()
-            .grid()
-            .grid_cols(1)
             .gap_1()
+            .when(fill_height && !collapsed, |this| this.flex_1().min_h_0())
             .child(
                 h_flex()
                     .w_full()
+                    .flex_none()
                     .gap_1()
                     .child(
                         Disclosure::new("toggle-commit-message", !collapsed)
@@ -4448,15 +4481,28 @@ impl GitGraph {
                     div()
                         .relative()
                         .w_full()
+                        .min_w_0()
+                        .when(fill_height, |this| this.flex_1().min_h_0())
                         .child(
                             div()
                                 .id("commit-message")
                                 .text_sm()
                                 .w_full()
-                                .max_h(line_height * 12.)
+                                .min_w_0()
+                                .when(fill_height, |this| this.h_full())
+                                .when(!fill_height, |this| this.max_h(line_height * 12.))
                                 .overflow_y_scroll()
                                 .track_scroll(scroll_handle)
-                                .child(MarkdownElement::new(message.clone(), message_style)),
+                                // Using grid over flexbox because the structure of this side
+                                // panel prevents taffy from calculating a concrete width correctly,
+                                // which causes problems with text reflow when using flexbox.
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .grid()
+                                        .grid_cols(1)
+                                        .child(MarkdownElement::new(message.clone(), message_style)),
+                                ),
                         )
                         .vertical_scrollbar_for(scroll_handle, window, cx),
                 )
