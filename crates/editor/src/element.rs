@@ -4828,6 +4828,8 @@ impl EditorElement {
         &self,
         row_range: Range<DisplayRow>,
         row_infos: &[RowInfo],
+        gutter_hitbox: &Hitbox,
+        gutter_dimensions: &GutterDimensions,
         text_hitbox: &Hitbox,
         newest_cursor_row: Option<DisplayRow>,
         line_height: Pixels,
@@ -4891,27 +4893,61 @@ impl EditorElement {
                     continue;
                 }
 
+                let hunk_start_y: Pixels = (display_row_range.start.as_f64()
+                    * ScrollPixelOffset::from(line_height)
+                    + ScrollPixelOffset::from(text_hitbox.bounds.top())
+                    - scroll_pixel_position.y)
+                    .into();
+
+                let y: Pixels = if hunk_start_y >= sticky_top {
+                    hunk_start_y
+                } else {
+                    let hunk_end_y: Pixels = hunk_start_y
+                        + (display_row_range.len() as f64 * ScrollPixelOffset::from(line_height))
+                            .into();
+                    let max_y = hunk_end_y - line_height;
+                    sticky_top.min(max_y)
+                };
+
+                if let Some(mut left_element) = diff_hunk_renderer.render_left_hunk_controls(
+                    display_row_range.start.0,
+                    status,
+                    multi_buffer_range.clone(),
+                    *is_created_file,
+                    line_height,
+                    &editor,
+                    window,
+                    cx,
+                ) {
+                    let size = left_element.layout_as_root(
+                        size(px(100.0), line_height).into(),
+                        window,
+                        cx,
+                    );
+
+                    let x = if gutter_hitbox.size.width > Pixels::ZERO {
+                        let fold_area_left = gutter_hitbox.bounds.left()
+                            + gutter_dimensions.width
+                            - gutter_dimensions.right_padding;
+                        (fold_area_left + (gutter_dimensions.fold_area_width() - size.width) / 2.)
+                            .max(gutter_hitbox.bounds.left())
+                    } else {
+                        text_hitbox.bounds.left() + px(2.)
+                    };
+
+                    let bounds = Bounds::new(gpui::Point::new(x, y), size);
+                    control_bounds.push((display_row_range.start, bounds));
+
+                    window.with_absolute_element_offset(gpui::Point::new(x, y), |window| {
+                        left_element.prepaint(window, cx)
+                    });
+                    controls.push(left_element);
+                }
+
                 if active_rows
                     .iter()
                     .any(|row| row.is_some_and(|row| display_row_range.contains(&row)))
                 {
-                    let hunk_start_y: Pixels = (display_row_range.start.as_f64()
-                        * ScrollPixelOffset::from(line_height)
-                        + ScrollPixelOffset::from(text_hitbox.bounds.top())
-                        - scroll_pixel_position.y)
-                        .into();
-
-                    let y: Pixels = if hunk_start_y >= sticky_top {
-                        hunk_start_y
-                    } else {
-                        let hunk_end_y: Pixels = hunk_start_y
-                            + (display_row_range.len() as f64
-                                * ScrollPixelOffset::from(line_height))
-                            .into();
-                        let max_y = hunk_end_y - line_height;
-                        sticky_top.min(max_y)
-                    };
-
                     let mut element = diff_hunk_renderer.render_hunk_controls(
                         display_row_range.start.0,
                         status,
@@ -5956,7 +5992,6 @@ impl EditorElement {
                 self.paint_inline_diagnostics(layout, window, cx);
                 self.paint_inline_blame(layout, window, cx);
                 self.paint_inline_code_actions(layout, window, cx);
-                self.paint_diff_hunk_controls(layout, window, cx);
                 window.with_element_namespace("crease_trailers", |window| {
                     for trailer in layout.crease_trailers.iter_mut().flatten() {
                         trailer.element.paint(window, cx);
@@ -9970,6 +10005,8 @@ impl Element for EditorElement {
                             self.layout_diff_hunk_controls(
                                 start_row..end_row,
                                 &row_infos,
+                                &gutter_hitbox,
+                                &gutter_dimensions,
                                 &text_hitbox,
                                 current_selection_head,
                                 line_height,
@@ -10158,6 +10195,8 @@ impl Element for EditorElement {
                             self.paint_gutter_highlights(layout, window, cx);
                             self.paint_gutter_indicators(layout, window, cx);
                         }
+
+                        self.paint_diff_hunk_controls(layout, window, cx);
 
                         if !layout.blocks.is_empty() {
                             window.with_element_namespace("blocks", |window| {

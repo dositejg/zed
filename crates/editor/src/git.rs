@@ -35,6 +35,20 @@ pub trait DiffHunkRenderer {
         cx: &mut App,
     ) -> AnyElement;
 
+    fn render_left_hunk_controls(
+        &self,
+        _row: u32,
+        _status: &DiffHunkStatus,
+        _hunk_range: Range<Anchor>,
+        _is_created_file: bool,
+        _line_height: Pixels,
+        _editor: &Entity<Editor>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<AnyElement> {
+        None
+    }
+
     fn render_hunk_as_staged(&self, status: &DiffHunkStatus, _cx: &App) -> bool {
         !status.has_secondary_hunk()
     }
@@ -57,6 +71,28 @@ impl DiffHunkRenderer for DefaultDiffHunkRenderer {
         render_diff_hunk_controls(
             row,
             status,
+            hunk_range,
+            is_created_file,
+            line_height,
+            editor,
+            window,
+            cx,
+        )
+    }
+
+    fn render_left_hunk_controls(
+        &self,
+        row: u32,
+        _status: &DiffHunkStatus,
+        hunk_range: Range<Anchor>,
+        is_created_file: bool,
+        line_height: Pixels,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        render_left_diff_hunk_restore_button(
+            row,
             hunk_range,
             is_created_file,
             line_height,
@@ -3028,6 +3064,61 @@ pub fn set_blame_renderer(renderer: impl BlameRenderer + 'static, cx: &mut App) 
     cx.set_global(GlobalBlameRenderer(Arc::new(renderer)));
 }
 
+pub fn render_left_diff_hunk_restore_button(
+    row: u32,
+    hunk_range: Range<Anchor>,
+    is_created_file: bool,
+    line_height: Pixels,
+    editor: &Entity<Editor>,
+    _window: &mut Window,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    if is_created_file
+        || !editor.read(cx).buffer().read(cx).all_diff_hunks_expanded()
+        || !ProjectSettings::get_global(cx)
+            .git
+            .show_stage_restore_buttons
+    {
+        return None;
+    }
+
+    let supports_restore = hunk_range
+        .start
+        .buffer_id()
+        .and_then(|buffer_id| editor.read(cx).buffer().read(cx).diff_for(buffer_id))
+        .and_then(|diff| diff.read(cx).operations())
+        .is_some_and(|operations| operations.supports_restore());
+    if !supports_restore {
+        return None;
+    }
+
+    let focus_handle = editor.focus_handle(cx);
+    Some(
+        h_flex()
+            .h(line_height)
+            .items_center()
+            .block_mouse_except_scroll()
+            .child(
+                IconButton::new(("restore-hunk-left", row as u64), IconName::Undo)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(move |_window, cx| {
+                        Tooltip::for_action_in("Restore Hunk", &::git::Restore, &focus_handle, cx)
+                    })
+                    .on_click({
+                        let editor = editor.clone();
+                        move |_event, window, cx| {
+                            editor.update(cx, |editor, cx| {
+                                let snapshot = editor.snapshot(window, cx);
+                                let point = hunk_range.start.to_point(&snapshot.buffer_snapshot());
+                                editor.restore_hunks_in_ranges(vec![point..point], window, cx);
+                            });
+                        }
+                    }),
+            )
+            .into_any_element(),
+    )
+}
+
 pub fn render_diff_hunk_controls(
     row: u32,
     status: &DiffHunkStatus,
@@ -3266,5 +3357,271 @@ impl Editor {
                 }
             });
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DiffViewStyle, SplittableEditor, editor_tests::init_test};
+    use gpui::{Modifiers, TestAppContext, UpdateGlobal};
+    use multi_buffer::PathKey;
+    use project::FakeFs;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use std::path::Path;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    struct EditorHost(Entity<Editor>);
+
+    impl Render for EditorHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0.clone()
+        }
+    }
+
+    #[gpui::test]
+    async fn test_left_diff_hunk_restore_button(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "line1\nchanged\nline3\n",
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("file.txt", "line1\nbase\nline3\n".to_string())],
+            "deadbeef",
+        );
+        fs.set_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("file.txt", "line1\nbase\nline3\n".to_string())],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/project/file.txt"), cx)
+            })
+            .await
+            .unwrap();
+        let diff = project
+            .update(cx, |project, cx| {
+                project.open_uncommitted_diff(buffer.clone(), cx)
+            })
+            .await
+            .unwrap();
+
+        let singleton = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
+        let (singleton_editor, cx) = cx.add_window_view(|window, cx| {
+            crate::test::build_editor_with_project(project.clone(), singleton, window, cx)
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        assert!(
+            cx.debug_bounds("ICON-Undo").is_none(),
+            "left restore button should not render in normal single-file editors"
+        );
+        drop(singleton_editor);
+
+        let multibuffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
+            multibuffer.set_all_diff_hunks_expanded(cx);
+            multibuffer.set_excerpts_for_path(
+                PathKey::for_buffer(&buffer, cx),
+                buffer.clone(),
+                [Point::new(0, 0)..Point::new(3, 0)],
+                0,
+                cx,
+            );
+            multibuffer.add_diff(diff, cx);
+            multibuffer
+        });
+        let (editor, cx) = cx.add_window_view(|window, cx| {
+            let mut editor =
+                Editor::for_multibuffer(multibuffer, Some(project.clone()), window, cx);
+            editor.set_expand_all_diff_hunks(cx);
+            editor.set_diff_hunk_renderer(Some(Arc::new(DefaultDiffHunkRenderer)), cx);
+            editor
+        });
+        cx.run_until_parked();
+
+        // Keep the cursor off the hunk to verify the left button is always visible.
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(0, 0)..Point::new(0, 0)]);
+            });
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+
+        let created_control = editor.update_in(cx, |editor, window, cx| {
+            let hunk = editor
+                .snapshot(window, cx)
+                .buffer_snapshot()
+                .diff_hunks_in_range(MultiBufferOffset(0)..MultiBufferOffset(100))
+                .next()
+                .expect("expected diff hunk");
+            let range = hunk.row_range.start..hunk.row_range.end;
+            let anchor_range = editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .anchor_after(Point::new(range.start.0, 0))
+                ..editor
+                    .buffer()
+                    .read(cx)
+                    .snapshot(cx)
+                    .anchor_after(Point::new(range.end.0, 0));
+            render_left_diff_hunk_restore_button(
+                0,
+                anchor_range,
+                true,
+                px(20.),
+                &cx.entity(),
+                window,
+                cx,
+            )
+        });
+        assert!(created_control.is_none());
+
+        let button_bounds = cx
+            .debug_bounds("ICON-Undo")
+            .expect("left restore button should always be visible in expanded diff editors");
+        let text_left = editor.read_with(cx, |editor, _| {
+            editor
+                .last_position_map
+                .as_ref()
+                .expect("position map")
+                .text_hitbox
+                .bounds
+                .left()
+        });
+        assert!(
+            button_bounds.left() < text_left,
+            "left restore button should render in the gutter to the left of text"
+        );
+
+        cx.simulate_click(button_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "line1\nbase\nline3\n"
+        );
+
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .git
+                        .get_or_insert_default()
+                        .show_stage_restore_buttons = Some(false);
+                });
+            });
+        });
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_text("line1\nchanged again\nline3\n", cx);
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("ICON-Undo").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_split_lhs_left_diff_hunk_restore_button(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "line1\nline3\n",
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("file.txt", "line1\nline2\nline3\n".to_string())],
+            "deadbeef",
+        );
+        fs.set_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("file.txt", "line1\nline2\nline3\n".to_string())],
+        );
+
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/project/file.txt"), cx)
+            })
+            .await
+            .unwrap();
+        let diff = project
+            .update(cx, |project, cx| {
+                project.open_uncommitted_diff(buffer.clone(), cx)
+            })
+            .await
+            .unwrap();
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let multibuffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
+            multibuffer.set_all_diff_hunks_expanded(cx);
+            multibuffer.set_excerpts_for_path(
+                PathKey::for_buffer(&buffer, cx),
+                buffer.clone(),
+                [Point::new(0, 0)..Point::new(2, 0)],
+                0,
+                cx,
+            );
+            multibuffer.add_diff(diff, cx);
+            multibuffer
+        });
+
+        let splittable = cx.new_window_entity(|window, cx| {
+            SplittableEditor::new(
+                DiffViewStyle::Split,
+                multibuffer,
+                project.clone(),
+                workspace,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Render just the LHS editor in a window to verify SplitLhsDiffHunkRenderer forwards
+        // `render_left_hunk_controls` and restores the hunk on click.
+        let lhs_editor = splittable.read_with(cx, |editor, _| {
+            editor
+                .lhs_editor()
+                .expect("split editor should have lhs")
+                .clone()
+        });
+        let (_lhs_window, lhs_cx) = cx.add_window_view(|_, _| EditorHost(lhs_editor.clone()));
+        lhs_cx.run_until_parked();
+        lhs_cx.refresh().unwrap();
+
+        let button_bounds = lhs_cx
+            .debug_bounds("ICON-Undo")
+            .expect("split lhs editor should render left restore button");
+        lhs_cx.simulate_click(button_bounds.center(), Modifiers::none());
+        lhs_cx.run_until_parked();
+
+        assert_eq!(
+            buffer.read_with(lhs_cx, |buffer, _| buffer.text()),
+            "line1\nline2\nline3\n"
+        );
     }
 }

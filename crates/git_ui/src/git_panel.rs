@@ -7303,6 +7303,10 @@ impl GitPanel {
             && GitPanelSettings::get_global(cx).diff_stats
             && diff_stat_total != DiffStat::default();
         let focus_handle = self.focus_handle.clone();
+        let can_rollback = (self.selected_entry.is_some() || self.has_marks())
+            && !is_branch_mode
+            && self.has_write_access(cx)
+            && !self.project.read(cx).is_read_only(cx);
 
         Some(
             h_flex()
@@ -7318,6 +7322,29 @@ impl GitPanel {
                     h_flex()
                         .gap_1()
                         .child(self.render_changes_mode_menu(cx))
+                        .child(
+                            IconButton::new("restore-button", IconName::Undo)
+                                .icon_size(IconSize::Small)
+                                .disabled(!can_rollback)
+                                .tooltip({
+                                    let focus_handle = focus_handle.clone();
+                                    move |_window, cx| {
+                                        Tooltip::for_action_in(
+                                            "Restore",
+                                            &RestoreFile::default(),
+                                            &focus_handle,
+                                            cx,
+                                        )
+                                    }
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.revert_selected(
+                                        &RestoreFile { skip_prompt: false },
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
                         .child(
                             ButtonLike::new("diff-button")
                                 .child(
@@ -8689,7 +8716,8 @@ impl GitPanel {
         let repo = self.active_repository.as_ref()?.read(cx);
         let project_path = (file.worktree_id(cx), file.path().clone()).into();
         let repo_path = repo.project_path_to_repo_path(&project_path, cx)?;
-        let entry = GitListEntry::Status(self.change_entry_by_path(&repo_path)?.clone());
+        let status_entry = self.change_entry_by_path(&repo_path)?.clone();
+        let entry = GitListEntry::Status(status_entry.clone());
 
         let is_staging_or_staged = repo
             .pending_ops_for_path(&repo_path)
@@ -8705,8 +8733,10 @@ impl GitPanel {
                     .and_then(|entry| entry.staging.as_bool())
             });
 
+        let has_write_access = self.has_write_access(cx);
+        let focus_handle = self.focus_handle.clone();
         let checkbox = Checkbox::new("stage-file", is_staging_or_staged.into())
-            .disabled(!self.has_write_access(cx))
+            .disabled(!has_write_access)
             .fill()
             .elevation(ElevationIndex::Surface)
             .on_click({
@@ -8717,14 +8747,39 @@ impl GitPanel {
                             this.toggle_staged_for_entry(&entry, StageIntent::Toggle, window, cx);
                             cx.stop_propagation();
                         })
-                        .ok();
+                        .log_err();
+                }
+            });
+        let restore_button = IconButton::new("restore-file", IconName::Undo)
+            .icon_size(IconSize::Small)
+            .disabled(!has_write_access)
+            .tooltip(move |_window, cx| {
+                Tooltip::for_action_in("Restore File", &RestoreFile::default(), &focus_handle, cx)
+            })
+            .on_click({
+                let git_panel = entity.downgrade();
+                move |_, window, cx| {
+                    let status_entry = status_entry.clone();
+                    git_panel
+                        .update(cx, |this, cx| {
+                            this.revert_entries(
+                                vec![DiscardTarget::new(status_entry, DiscardScope::All)],
+                                false,
+                                window,
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        })
+                        .log_err();
                 }
             });
         Some(
             h_flex()
                 .id("start-slot")
+                .gap_1()
                 .text_lg()
                 .child(checkbox)
+                .child(restore_button)
                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                     // prevent the list item active state triggering when toggling checkbox
                     cx.stop_propagation();
@@ -18719,5 +18774,120 @@ mod tests {
         });
         settle_branch_mode(cx);
         assert!(base_picker_open(&test.workspace, cx));
+    }
+
+    #[gpui::test]
+    async fn test_changes_header_restore_button(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (fs, _project, workspace, panel, mut cx) = setup_git_panel_with_changes(
+            cx,
+            json!({
+                ".git": {},
+                "file.rs": "modified\n",
+            }),
+            &[("file.rs", StatusCode::Modified)],
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("file.rs", "original\n".to_string())],
+        );
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.update_in(&mut cx, |panel, _window, cx| {
+            panel.selected_entry = None;
+            panel.clear_marks();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+
+        let restore_bounds = cx
+            .debug_bounds("ICON-Undo")
+            .expect("restore button should always be visible in changes header");
+        cx.simulate_click(restore_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            !cx.has_pending_prompt(),
+            "restore button should be disabled when nothing is selected or marked"
+        );
+
+        panel.update_in(&mut cx, |panel, _window, cx| {
+            panel.selected_entry = entry_index_for_repo_path(panel, &repo_path("file.rs"));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+
+        let restore_bounds = cx
+            .debug_bounds("ICON-Undo")
+            .expect("restore button should remain visible when a file is selected");
+        cx.simulate_click(restore_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Discard Changes");
+        cx.run_until_parked();
+
+        assert_eq!(
+            fs.load(Path::new(path!("/project/file.rs"))).await.unwrap(),
+            "original\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_buffer_header_controls_restore_file_button(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (fs, _project, workspace, panel, mut cx) = setup_git_panel_with_changes(
+            cx,
+            json!({
+                ".git": {},
+                "file.rs": "modified\n",
+            }),
+            &[("file.rs", StatusCode::Modified)],
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("file.rs", "original\n".to_string())],
+        );
+
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .git
+                        .get_or_insert_default()
+                        .show_stage_restore_buttons = Some(false);
+                });
+            });
+        });
+
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            ProjectDiff::deploy_at(workspace, None, window, cx);
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+
+        let restore_bounds = cx
+            .debug_bounds("ICON-Undo")
+            .expect("buffer header restore-file button should be rendered");
+        cx.simulate_click(restore_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Discard Changes");
+        cx.run_until_parked();
+
+        assert_eq!(
+            fs.load(Path::new(path!("/project/file.rs"))).await.unwrap(),
+            "original\n"
+        );
     }
 }

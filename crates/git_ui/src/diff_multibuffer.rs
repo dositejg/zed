@@ -707,6 +707,11 @@ impl DiffMultibuffer {
             if let Some(loaded_buffer) = loaded.log_err() {
                 cx.update(|window, cx| {
                     this.update(cx, |this, cx| {
+                        if this.buffer_subscriptions.contains_key(&repo_path)
+                            && loaded_buffer.display_buffer.read(cx).is_dirty()
+                        {
+                            return;
+                        }
                         if let Some(buffer_id) = this.register_buffer(
                             repo_path,
                             path_key,

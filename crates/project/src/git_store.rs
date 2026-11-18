@@ -160,6 +160,7 @@ struct SharedDiffs {
 }
 
 struct BufferGitState {
+    git_store: WeakEntity<GitStore>,
     unstaged_diff: Option<WeakEntity<BufferDiff>>,
     staged_diff: Option<(WeakEntity<BufferDiff>, Entity<Buffer>)>,
     uncommitted_diff: Option<WeakEntity<BufferDiff>>,
@@ -845,6 +846,8 @@ pub enum UnshallowState {
 pub struct Repository {
     this: WeakEntity<Self>,
     snapshot: RepositorySnapshot,
+    disk_statuses_by_path: SumTree<StatusEntry>,
+    buffer_status_overrides: HashMap<RepoPath, Option<StatusEntry>>,
     unshallow_state: UnshallowState,
     commit_message_buffer: Option<Entity<Buffer>>,
     git_store: WeakEntity<GitStore>,
@@ -3151,8 +3154,8 @@ impl GitStore {
         match event {
             BufferStoreEvent::BufferAdded(buffer) => {
                 self.activate_parked_repositories_for_buffer(buffer, cx);
-                cx.subscribe(buffer, |this, buffer, event, cx| {
-                    if let BufferEvent::LanguageChanged(_) = event {
+                cx.subscribe(buffer, |this, buffer, event, cx| match event {
+                    BufferEvent::LanguageChanged(_) => {
                         let buffer_id = buffer.read(cx).remote_id();
                         if let Some(diff_state) = this.diffs.get(&buffer_id) {
                             diff_state.update(cx, |diff_state, cx| {
@@ -3160,6 +3163,21 @@ impl GitStore {
                             });
                         }
                     }
+                    BufferEvent::Reloaded => {
+                        let is_clean = {
+                            let buffer = buffer.read(cx);
+                            !buffer.is_dirty() && !buffer.has_unsaved_edits()
+                        };
+                        if is_clean {
+                            let buffer_id = buffer.read(cx).remote_id();
+                            if let Some((repo, repo_path)) =
+                                this.repository_and_path_for_buffer_id(buffer_id, cx)
+                            {
+                                Self::clear_buffer_status_override(&repo, &repo_path, cx);
+                            }
+                        }
+                    }
+                    _ => {}
                 })
                 .detach();
             }
@@ -3174,6 +3192,21 @@ impl GitStore {
                     .retain(|_, main_buffer_id| main_buffer_id != buffer_id);
                 for diffs in self.shared_diffs.values_mut() {
                     diffs.remove(buffer_id);
+                }
+                let buffer_store = self.buffer_store.clone();
+                let worktree_store = self.worktree_store.clone();
+                for repo in self.repositories.values() {
+                    repo.update(cx, |repo, cx| {
+                        repo.prune_clean_buffer_status_overrides_with_stores(
+                            &buffer_store,
+                            &worktree_store,
+                            None,
+                            cx,
+                        );
+                        if repo.rebuild_effective_statuses() {
+                            cx.emit(RepositoryEvent::StatusesChanged);
+                        }
+                    });
                 }
             }
             BufferStoreEvent::BufferChangedFilePath { buffer, .. } => {
@@ -3230,23 +3263,177 @@ impl GitStore {
     ) -> impl Future<Output = ()> + use<> {
         let mut futures = Vec::new();
         for buffer in buffers {
-            if let Some(diff_state) = self.diffs.get_mut(&buffer.read(cx).remote_id()) {
-                let buffer = buffer.read(cx).text_snapshot();
-                diff_state.update(cx, |diff_state, cx| {
-                    diff_state.recalculate_diffs(buffer.clone(), cx);
-                    futures.extend(diff_state.wait_for_recalculation().map(FutureExt::boxed));
+            let buffer_id = buffer.read(cx).remote_id();
+            let diff_state = self.diffs.get(&buffer_id).cloned();
+            let needs_uncommitted_diff = diff_state
+                .as_ref()
+                .is_none_or(|diff_state| diff_state.read(cx).unstaged_diff().is_none());
+            let open_live_diff = if needs_uncommitted_diff {
+                let is_dirty = {
+                    let buffer = buffer.read(cx);
+                    buffer.is_dirty() || buffer.has_unsaved_edits()
+                };
+                let repo_and_path = self.repository_and_path_for_buffer_id(buffer_id, cx);
+                let has_override = repo_and_path.as_ref().is_some_and(|(repo, repo_path)| {
+                    repo.read(cx)
+                        .buffer_status_overrides
+                        .contains_key(repo_path)
                 });
+                (is_dirty || has_override) && repo_and_path.is_some()
+            } else {
+                false
+            };
+
+            if let Some(diff_state) = &diff_state {
+                let text_snapshot = buffer.read(cx).text_snapshot();
+                if !open_live_diff {
+                    diff_state.update(cx, |diff_state, cx| {
+                        diff_state.recalculate_diffs(text_snapshot.clone(), cx);
+                        futures.extend(diff_state.wait_for_recalculation().map(FutureExt::boxed));
+                    });
+                }
                 futures.push(diff_state.update(cx, |diff_state, cx| {
                     diff_state
-                        .reparse_conflict_markers(buffer, cx)
+                        .reparse_conflict_markers(text_snapshot, cx)
                         .map(|_| {})
                         .boxed()
                 }));
+            }
+
+            if open_live_diff {
+                let task = self.open_uncommitted_diff(buffer, cx);
+                futures.push(
+                    async move {
+                        task.await.ok();
+                    }
+                    .boxed(),
+                );
             }
         }
         async move {
             futures::future::join_all(futures).await;
         }
+    }
+
+    fn clear_buffer_status_override(
+        repo: &Entity<Repository>,
+        repo_path: &RepoPath,
+        cx: &mut App,
+    ) {
+        if repo.read(cx).buffer_status_overrides.contains_key(repo_path) {
+            repo.update(cx, |repo, cx| {
+                repo.buffer_status_overrides.remove(repo_path);
+                if repo.rebuild_effective_statuses() {
+                    cx.emit(RepositoryEvent::StatusesChanged);
+                }
+            });
+        }
+    }
+
+    fn update_buffer_status_override(&mut self, buffer_id: BufferId, cx: &mut Context<Self>) {
+        let Some(buffer) = self.buffer_store.read(cx).get(buffer_id) else {
+            return;
+        };
+        let Some((repo, repo_path)) = self.repository_and_path_for_buffer_id(buffer_id, cx) else {
+            return;
+        };
+        let Some(diff_state) = self.diffs.get(&buffer_id) else {
+            return;
+        };
+
+        let is_dirty = {
+            let buffer = buffer.read(cx);
+            buffer.is_dirty() || buffer.has_unsaved_edits()
+        };
+        if !is_dirty && !repo.read(cx).buffer_status_overrides.contains_key(&repo_path) {
+            return;
+        }
+
+        let (unstaged_diff, uncommitted_diff) = {
+            let diff_state = diff_state.read(cx);
+            if diff_state.index_text.is_none() {
+                Self::clear_buffer_status_override(&repo, &repo_path, cx);
+                return;
+            }
+            let Some(unstaged_diff) = diff_state.unstaged_diff() else {
+                return;
+            };
+            (unstaged_diff, diff_state.uncommitted_diff())
+        };
+
+        let disk_entry = repo
+            .read(cx)
+            .disk_statuses_by_path
+            .get(&PathKey(repo_path.as_ref().clone()), ())
+            .cloned();
+        if disk_entry.as_ref().is_some_and(|entry| {
+            entry.status.is_conflicted()
+                || entry.status.is_deleted()
+                || entry.status.is_untracked()
+                || entry.status.is_ignored()
+        }) {
+            Self::clear_buffer_status_override(&repo, &repo_path, cx);
+            return;
+        }
+
+        let unstaged_snapshot = unstaged_diff.read(cx).snapshot(cx);
+        let index_status = match disk_entry.as_ref().map(|entry| entry.status) {
+            Some(FileStatus::Tracked(tracked)) => tracked.index_status,
+            _ => StatusCode::Unmodified,
+        };
+        let has_unstaged_changes = !unstaged_snapshot.is_empty();
+        let worktree_status = if has_unstaged_changes {
+            StatusCode::Modified
+        } else {
+            StatusCode::Unmodified
+        };
+
+        let live_entry = if index_status == StatusCode::Unmodified
+            && worktree_status == StatusCode::Unmodified
+        {
+            None
+        } else {
+            let unstaged_diff_stat = if has_unstaged_changes {
+                let (added, deleted) = unstaged_snapshot.changed_row_counts();
+                Some(DiffStat { added, deleted })
+            } else {
+                None
+            };
+            let staged_diff_stat = disk_entry.as_ref().and_then(|entry| entry.staged_diff_stat);
+            let diff_stat = if let Some(uncommitted_diff) = uncommitted_diff {
+                let uncommitted_snapshot = uncommitted_diff.read(cx).snapshot(cx);
+                if uncommitted_snapshot.is_empty() {
+                    None
+                } else {
+                    let (added, deleted) = uncommitted_snapshot.changed_row_counts();
+                    Some(DiffStat { added, deleted })
+                }
+            } else {
+                unstaged_diff_stat.or(staged_diff_stat)
+            };
+
+            Some(StatusEntry {
+                repo_path: repo_path.clone(),
+                status: FileStatus::Tracked(TrackedStatus {
+                    index_status,
+                    worktree_status,
+                }),
+                diff_stat,
+                staged_diff_stat,
+                unstaged_diff_stat,
+            })
+        };
+
+        repo.update(cx, |repo, cx| {
+            if !is_dirty && live_entry == disk_entry {
+                repo.buffer_status_overrides.remove(&repo_path);
+            } else {
+                repo.buffer_status_overrides.insert(repo_path, live_entry);
+            }
+            if repo.rebuild_effective_statuses() {
+                cx.emit(RepositoryEvent::StatusesChanged);
+            }
+        });
     }
 
     fn write_index_text_for_buffer_id(
@@ -3546,9 +3733,13 @@ impl GitStore {
             });
             this._subscriptions.extend(repo_subscription);
 
+            let buffer_store = this.buffer_store.clone();
+            let worktree_store = this.worktree_store.clone();
             repo.update(cx, {
                 let update = update.clone();
-                |repo, cx| repo.apply_remote_update(update, cx)
+                |repo, cx| {
+                    repo.apply_remote_update(update, &buffer_store, &worktree_store, cx)
+                }
             })?;
 
             if is_new {
@@ -5393,8 +5584,9 @@ impl GitStore {
 }
 
 impl BufferGitState {
-    fn new(_git_store: WeakEntity<GitStore>, _cx: &mut Context<Self>) -> Self {
+    fn new(git_store: WeakEntity<GitStore>, _cx: &mut Context<Self>) -> Self {
         Self {
+            git_store,
             unstaged_diff: Default::default(),
             staged_diff: Default::default(),
             uncommitted_diff: Default::default(),
@@ -6069,12 +6261,19 @@ impl BufferGitState {
                 buffer.remote_id()
             );
 
-            if let Some(this) = this.upgrade() {
+            let git_store = this.upgrade().map(|this| {
                 this.update(cx, |this, _| {
                     this.index_changed = false;
                     this.head_changed = false;
                     this.language_changed = false;
                     *this.recalculating_tx.borrow_mut() = false;
+                    this.git_store.clone()
+                })
+            });
+
+            if let Some(git_store) = git_store.and_then(|git_store| git_store.upgrade()) {
+                git_store.update(cx, |git_store, cx| {
+                    git_store.update_buffer_status_override(buffer.remote_id(), cx);
                 });
             }
 
@@ -6747,6 +6946,8 @@ impl Repository {
             git_store,
             object_read_limiter,
             snapshot,
+            disk_statuses_by_path: Default::default(),
+            buffer_status_overrides: Default::default(),
             unshallow_state: UnshallowState::default(),
             pending_ops: Default::default(),
             repository_state: Task::ready(Err("not yet initialized".into())).shared(),
@@ -6799,6 +7000,8 @@ impl Repository {
         Self {
             this: cx.weak_entity(),
             snapshot,
+            disk_statuses_by_path: Default::default(),
+            buffer_status_overrides: Default::default(),
             unshallow_state: UnshallowState::default(),
             commit_message_buffer: None,
             git_store,
@@ -6819,6 +7022,94 @@ impl Repository {
             commit_data_handler: CommitDataHandlerState::Closed,
             auto_fetch: AutoFetchState::default(),
         }
+    }
+
+    fn rebuild_effective_statuses(&mut self) -> bool {
+        let mut new_statuses = self.disk_statuses_by_path.clone();
+        if !self.buffer_status_overrides.is_empty() {
+            let edits = self
+                .buffer_status_overrides
+                .iter()
+                .map(|(repo_path, override_entry)| match override_entry {
+                    Some(entry) => Edit::Insert(entry.clone()),
+                    None => Edit::Remove(PathKey(repo_path.as_ref().clone())),
+                })
+                .collect();
+            new_statuses.edit(edits, ());
+        }
+        if !self
+            .snapshot
+            .statuses_by_path
+            .iter()
+            .eq(new_statuses.iter())
+        {
+            self.snapshot.statuses_by_path = new_statuses;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn prune_clean_buffer_status_overrides(
+        &mut self,
+        scanned_paths: Option<&[RepoPath]>,
+        cx: &App,
+    ) {
+        if self.buffer_status_overrides.is_empty() {
+            return;
+        }
+        let Some(git_store) = self.git_store.upgrade() else {
+            self.buffer_status_overrides.clear();
+            return;
+        };
+        let git_store = git_store.read(cx);
+        self.prune_clean_buffer_status_overrides_with_stores(
+            &git_store.buffer_store,
+            &git_store.worktree_store,
+            scanned_paths,
+            cx,
+        );
+    }
+
+    fn prune_clean_buffer_status_overrides_with_stores(
+        &mut self,
+        buffer_store: &Entity<BufferStore>,
+        worktree_store: &Entity<WorktreeStore>,
+        scanned_paths: Option<&[RepoPath]>,
+        cx: &App,
+    ) {
+        if self.buffer_status_overrides.is_empty() {
+            return;
+        }
+        let buffer_store = buffer_store.read(cx);
+        let worktree_store = worktree_store.read(cx);
+        let snapshot = &self.snapshot;
+        let disk_statuses = &self.disk_statuses_by_path;
+        self.buffer_status_overrides
+            .retain(|repo_path, override_entry| {
+                let abs_path = snapshot.repo_path_to_abs_path(repo_path);
+                let abs_path = SanitizedPath::new(&abs_path);
+                let Some((worktree, relative_path)) = worktree_store.find_worktree(abs_path, cx)
+                else {
+                    return false;
+                };
+                let project_path = ProjectPath {
+                    worktree_id: worktree.read(cx).id(),
+                    path: relative_path,
+                };
+                let Some(buffer) = buffer_store.get_by_path(&project_path) else {
+                    return false;
+                };
+                let buffer = buffer.read(cx);
+                if buffer.is_dirty() || buffer.has_unsaved_edits() {
+                    return true;
+                }
+                let covered_by_scan = scanned_paths
+                    .is_some_and(|paths| paths.iter().any(|path| repo_path.starts_with(path)));
+                let matches_disk = disk_statuses.get(&PathKey(repo_path.as_ref().clone()), ())
+                    == override_entry.as_ref();
+                !(covered_by_scan || matches_disk)
+            });
     }
 
     fn handle_subscribe_self(&mut self, event: &RepositoryEvent, _: &mut Context<Self>) {
@@ -7284,45 +7575,59 @@ impl Repository {
             ),
         };
 
+        let checked_out_paths = paths.clone();
         self.spawn_job_with_tracking(paths.clone(), git_status, cx, async move |this, cx| {
-            this.update(cx, |this, _cx| {
-                this.send_job(
-                    "checkout_files",
-                    Some(description.into()),
-                    move |git_repo, _| async move {
-                        match git_repo {
-                            RepositoryState::Local(LocalRepositoryState {
-                                backend,
-                                environment,
-                                ..
-                            }) => {
-                                backend
-                                    .checkout_files(commit, paths, environment.clone())
-                                    .await
-                            }
-                            RepositoryState::Remote(RemoteRepositoryState {
-                                project_id,
-                                client,
-                            }) => {
-                                client
-                                    .request(proto::GitCheckoutFiles {
-                                        project_id: project_id.0,
-                                        repository_id: id.to_proto(),
-                                        commit: commit.unwrap_or_default(),
-                                        paths: paths
-                                            .into_iter()
-                                            .map(|p| p.as_unix_str().to_owned())
-                                            .collect(),
-                                    })
-                                    .await?;
+            let result = this
+                .update(cx, |this, _cx| {
+                    this.send_job(
+                        "checkout_files",
+                        Some(description.into()),
+                        move |git_repo, _| async move {
+                            match git_repo {
+                                RepositoryState::Local(LocalRepositoryState {
+                                    backend,
+                                    environment,
+                                    ..
+                                }) => {
+                                    backend
+                                        .checkout_files(commit, paths, environment.clone())
+                                        .await
+                                }
+                                RepositoryState::Remote(RemoteRepositoryState {
+                                    project_id,
+                                    client,
+                                }) => {
+                                    client
+                                        .request(proto::GitCheckoutFiles {
+                                            project_id: project_id.0,
+                                            repository_id: id.to_proto(),
+                                            commit: commit.unwrap_or_default(),
+                                            paths: paths
+                                                .into_iter()
+                                                .map(|p| p.as_unix_str().to_owned())
+                                                .collect(),
+                                        })
+                                        .await?;
 
-                                Ok(())
+                                    Ok(())
+                                }
                             }
-                        }
-                    },
-                )
-            })?
-            .await?
+                        },
+                    )
+                })?
+                .await?;
+            if result.is_ok() {
+                this.update(cx, |this, cx| {
+                    let mut removed_any = false;
+                    for path in &checked_out_paths {
+                        removed_any |= this.buffer_status_overrides.remove(path).is_some();
+                    }
+                    if removed_any && this.rebuild_effective_statuses() {
+                        cx.emit(RepositoryEvent::StatusesChanged);
+                    }
+                })?;
+            }
+            result
         })
     }
 
@@ -8167,12 +8472,18 @@ impl Repository {
     ) -> Vec<Task<anyhow::Result<()>>> {
         let mut save_futures = Vec::new();
         if let Some(buffer_store) = self.buffer_store(cx) {
+            let mut seen_paths = HashSet::new();
+            let mut seen_buffer_ids = HashSet::new();
             buffer_store.update(cx, |buffer_store, cx| {
-                for path in entries {
+                let mut save_path = |path: &RepoPath| {
+                    if !seen_paths.insert(path.clone()) {
+                        return;
+                    }
                     let Some(project_path) = self.repo_path_to_project_path(path, cx) else {
-                        continue;
+                        return;
                     };
                     if let Some(buffer) = buffer_store.get_by_path(&project_path)
+                        && seen_buffer_ids.insert(buffer.read(cx).remote_id())
                         && buffer
                             .read(cx)
                             .file()
@@ -8180,6 +8491,14 @@ impl Repository {
                         && buffer.read(cx).has_unsaved_edits()
                     {
                         save_futures.push(buffer_store.save_buffer(buffer, cx));
+                    }
+                };
+                for path in entries {
+                    save_path(path);
+                }
+                for (path, override_entry) in &self.buffer_status_overrides {
+                    if override_entry.is_none() {
+                        save_path(path);
                     }
                 }
             })
@@ -10261,6 +10580,8 @@ impl Repository {
     pub(crate) fn apply_remote_update(
         &mut self,
         update: proto::UpdateRepository,
+        buffer_store: &Entity<BufferStore>,
+        worktree_store: &Entity<WorktreeStore>,
         cx: &mut Context<Self>,
     ) -> Result<()> {
         if let Some(repository_dir_abs_path) = &update.repository_dir_abs_path {
@@ -10347,10 +10668,16 @@ impl Repository {
                     }),
             )
             .collect::<Vec<_>>();
-        if conflicts_changed || !edits.is_empty() {
+        self.disk_statuses_by_path.edit(edits, ());
+        self.prune_clean_buffer_status_overrides_with_stores(
+            buffer_store,
+            worktree_store,
+            None,
+            cx,
+        );
+        if conflicts_changed || self.rebuild_effective_statuses() {
             cx.emit(RepositoryEvent::StatusesChanged);
         }
-        self.snapshot.statuses_by_path.edit(edits, ());
 
         if update.is_last_update {
             self.snapshot.scan_id = update.scan_id;
@@ -10696,12 +11023,14 @@ impl Repository {
             Some(GitJobKey::RefreshStatuses),
             None,
             |state, mut cx| async move {
-                let (prev_snapshot, changed_paths) = this.update(&mut cx, |this, _| {
-                    (
-                        this.snapshot.clone(),
-                        mem::take(&mut this.paths_needing_status_update),
-                    )
-                })?;
+                let (prev_snapshot, prev_statuses, changed_paths) =
+                    this.update(&mut cx, |this, _| {
+                        (
+                            this.snapshot.clone(),
+                            this.disk_statuses_by_path.clone(),
+                            mem::take(&mut this.paths_needing_status_update),
+                        )
+                    })?;
                 let RepositoryState::Local(LocalRepositoryState { backend, .. }) = state else {
                     bail!("not a local repository")
                 };
@@ -10712,7 +11041,7 @@ impl Repository {
 
                 let has_head = prev_snapshot.head_commit.is_some();
 
-                let changed_path_statuses = cx
+                let (changed_paths_vec, changed_path_statuses) = cx
                     .background_spawn(async move {
                         let changed_paths =
                             GitStore::limit_repo_paths(GitStore::coalesce_repo_paths(
@@ -10751,7 +11080,6 @@ impl Repository {
                             HashMap::from_iter(unstaged_diff_stats.entries.into_iter().cloned());
 
                         let mut changed_path_statuses = Vec::new();
-                        let prev_statuses = prev_snapshot.statuses_by_path.clone();
                         let current_status_paths = statuses
                             .entries
                             .iter()
@@ -10803,16 +11131,19 @@ impl Repository {
                                 unstaged_diff_stat: current_unstaged_diff_stat,
                             }));
                         }
-                        anyhow::Ok(changed_path_statuses)
+                        anyhow::Ok((changed_paths_vec, changed_path_statuses))
                     })
                     .await?;
 
                 this.update(&mut cx, |this, cx| {
-                    if !changed_path_statuses.is_empty() {
+                    let disk_changed = !changed_path_statuses.is_empty();
+                    if disk_changed {
+                        this.disk_statuses_by_path.edit(changed_path_statuses, ());
+                    }
+                    this.prune_clean_buffer_status_overrides(Some(&changed_paths_vec), cx);
+                    let effective_changed = this.rebuild_effective_statuses();
+                    if effective_changed || disk_changed {
                         cx.emit(RepositoryEvent::StatusesChanged);
-                        this.snapshot
-                            .statuses_by_path
-                            .edit(changed_path_statuses, ());
                         this.snapshot.scan_id += 1;
                     }
 
@@ -13614,6 +13945,156 @@ mod tests {
             repo_paths(&["submodule/a.txt", "submodule/nested/b.txt", "top_level.rs"])
         );
     }
+
+    #[gpui::test]
+    async fn test_live_buffer_edits_update_cached_status(cx: &mut TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use util::{path, rel_path::rel_path};
+
+        init_test(cx);
+
+        let project_root = Path::new(path!("/project"));
+        let dot_git = project_root.join(".git");
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            project_root,
+            json!({
+                ".git": {},
+                "clean.txt": "initial\n",
+                "modified.txt": "disk\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            &dot_git,
+            &[
+                ("clean.txt", "initial\n".into()),
+                ("modified.txt", "head\n".into()),
+            ],
+        );
+
+        let project = Project::test(fs, [project_root], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("active repository")
+        });
+
+        let status_changed_count = Arc::new(AtomicUsize::new(0));
+        let _subscription = cx.update(|cx| {
+            let status_changed_count = status_changed_count.clone();
+            cx.subscribe(&repository, move |_, event, _| {
+                if matches!(event, RepositoryEvent::StatusesChanged) {
+                    status_changed_count.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        });
+
+        let status_paths = |cx: &mut TestAppContext| {
+            repository.read_with(cx, |repository, _| {
+                repository
+                    .cached_status()
+                    .map(|entry| (entry.repo_path, entry.status))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        let expected_modified = FileStatus::Tracked(TrackedStatus {
+            index_status: StatusCode::Unmodified,
+            worktree_status: StatusCode::Modified,
+        });
+
+        assert_eq!(
+            status_paths(cx),
+            vec![(repo_path("modified.txt"), expected_modified)]
+        );
+
+        let clean_buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer((worktree_id, rel_path("clean.txt")), cx)
+            })
+            .await
+            .expect("open clean buffer");
+
+        let prev_count = status_changed_count.load(Ordering::SeqCst);
+        clean_buffer.update(cx, |buffer, cx| {
+            buffer.set_text("initial\nedited\n", cx);
+        });
+        cx.run_until_parked();
+        assert!(clean_buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
+        assert!(status_changed_count.load(Ordering::SeqCst) > prev_count);
+        assert_eq!(
+            status_paths(cx),
+            vec![
+                (repo_path("clean.txt"), expected_modified),
+                (repo_path("modified.txt"), expected_modified),
+            ]
+        );
+
+        let prev_count = status_changed_count.load(Ordering::SeqCst);
+        clean_buffer.update(cx, |buffer, cx| {
+            buffer.set_text("initial\n", cx);
+        });
+        cx.run_until_parked();
+        assert!(clean_buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
+        assert!(status_changed_count.load(Ordering::SeqCst) > prev_count);
+        assert_eq!(
+            status_paths(cx),
+            vec![(repo_path("modified.txt"), expected_modified)]
+        );
+
+        let prev_count = status_changed_count.load(Ordering::SeqCst);
+        clean_buffer.update(cx, |buffer, cx| {
+            buffer.set_text("initial\nagain\n", cx);
+        });
+        cx.run_until_parked();
+        assert!(status_changed_count.load(Ordering::SeqCst) > prev_count);
+        assert_eq!(
+            status_paths(cx),
+            vec![
+                (repo_path("clean.txt"), expected_modified),
+                (repo_path("modified.txt"), expected_modified),
+            ]
+        );
+
+        let modified_buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer((worktree_id, rel_path("modified.txt")), cx)
+            })
+            .await
+            .expect("open modified buffer");
+
+        let prev_count = status_changed_count.load(Ordering::SeqCst);
+        modified_buffer.update(cx, |buffer, cx| {
+            buffer.set_text("head\n", cx);
+        });
+        cx.run_until_parked();
+        assert!(modified_buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
+        assert!(status_changed_count.load(Ordering::SeqCst) > prev_count);
+        assert_eq!(
+            status_paths(cx),
+            vec![(repo_path("clean.txt"), expected_modified)]
+        );
+
+        let prev_count = status_changed_count.load(Ordering::SeqCst);
+        modified_buffer.update(cx, |buffer, cx| {
+            buffer.set_text("re-edited\n", cx);
+        });
+        cx.run_until_parked();
+        assert!(status_changed_count.load(Ordering::SeqCst) > prev_count);
+        assert_eq!(
+            status_paths(cx),
+            vec![
+                (repo_path("clean.txt"), expected_modified),
+                (repo_path("modified.txt"), expected_modified),
+            ]
+        );
+    }
 }
 
 /// This snapshot computes the repository state on the foreground thread while
@@ -13793,7 +14274,17 @@ async fn compute_snapshot(
     log::debug!("new merge details: {merge_details:?}");
 
     this.update(cx, |this, cx| {
-        if conflicts_changed || statuses_by_path != this.snapshot.statuses_by_path {
+        let disk_changed = !this
+            .disk_statuses_by_path
+            .iter()
+            .eq(statuses_by_path.iter());
+        this.disk_statuses_by_path = statuses_by_path;
+        this.prune_clean_buffer_status_overrides(
+            Some(&[RepoPath::from_rel_path(RelPath::empty())]),
+            cx,
+        );
+        let effective_changed = this.rebuild_effective_statuses();
+        if conflicts_changed || effective_changed || disk_changed {
             cx.emit(RepositoryEvent::StatusesChanged);
         }
         if stash_entries != this.snapshot.stash_entries {
@@ -13802,7 +14293,6 @@ async fn compute_snapshot(
 
         this.snapshot.scan_id += 1;
         this.snapshot.merge = merge_details;
-        this.snapshot.statuses_by_path = statuses_by_path;
         this.snapshot.stash_entries = stash_entries;
 
         this.snapshot.clone()

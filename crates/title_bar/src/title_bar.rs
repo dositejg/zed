@@ -417,6 +417,7 @@ impl Render for TitleBar {
                 .when(TitleBarSettings::get_global(cx).show_user_menu, |this| {
                     this.child(self.render_user_menu_button(cx))
                 })
+                .child(self.render_search_button())
                 .into_any_element(),
         );
 
@@ -1446,6 +1447,27 @@ impl TitleBar {
             })
             .anchor(Anchor::TopRight)
     }
+
+    fn render_search_button(&self) -> impl IntoElement {
+        let workspace = self.workspace.clone();
+        IconButton::new("search-files", IconName::MagnifyingGlass)
+            .icon_size(IconSize::Small)
+            .tooltip(Tooltip::for_action_title(
+                "Search Files",
+                &workspace::ToggleFileFinder::default(),
+            ))
+            .on_click(move |_, window, cx| {
+                if let Some(workspace) = workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        if window.focused(cx).is_none() {
+                            let focus_handle = workspace.focus_handle(cx);
+                            window.focus(&focus_handle, cx);
+                        }
+                    });
+                }
+                window.dispatch_action(workspace::ToggleFileFinder::default().boxed_clone(), cx);
+            })
+    }
 }
 
 #[cfg(test)]
@@ -1534,6 +1556,47 @@ mod tests {
         assert!(window_tabs_mounted(cx));
     }
 
+    #[gpui::test]
+    async fn test_search_button_dispatches_toggle_file_finder(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let project = init_test_project(TitleBarVisibility::Always, cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+        let dispatch_count = Arc::new(AtomicUsize::new(0));
+        workspace.update(cx, {
+            let dispatch_count = dispatch_count.clone();
+            move |workspace, _| {
+                workspace.register_action(move |_, _: &workspace::ToggleFileFinder, _, _| {
+                    dispatch_count.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        multi_workspace.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+
+        let search_button_bounds = cx
+            .debug_bounds("ICON-MagnifyingGlass")
+            .expect("search-files magnifier button should be rendered in title bar");
+        let viewport_size = cx.update(|window, _| window.viewport_size());
+        assert!(search_button_bounds.size.width > px(0.));
+        assert!(search_button_bounds.size.height > px(0.));
+        assert!(search_button_bounds.center().x > viewport_size.width * 0.5);
+        assert!(search_button_bounds.center().y < viewport_size.height * 0.25);
+
+        cx.simulate_click(search_button_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+
+        cx.simulate_click(search_button_bounds.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 2);
+    }
+
     #[derive(Debug, PartialEq)]
     struct Chrome {
         title_bar: bool,
@@ -1568,10 +1631,10 @@ mod tests {
         right: false,
     };
 
-    async fn init_test(
+    async fn init_test_project(
         visibility: TitleBarVisibility,
         cx: &mut TestAppContext,
-    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+    ) -> Entity<Project> {
         cx.update(|cx| {
             let mut settings = SettingsStore::test(cx);
             settings.update_user_settings(cx, |settings| {
@@ -1588,6 +1651,14 @@ mod tests {
             call::init(project.client(), project.user_store(), cx);
             init(cx);
         });
+        project
+    }
+
+    async fn init_test(
+        visibility: TitleBarVisibility,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, &mut VisualTestContext) {
+        let project = init_test_project(visibility, cx).await;
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
         cx.run_until_parked();

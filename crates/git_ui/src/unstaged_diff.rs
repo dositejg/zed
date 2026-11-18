@@ -112,6 +112,55 @@ impl DiffHunkRenderer for UnstagedDiffHunkRenderer {
             .into_any_element()
     }
 
+    fn render_left_hunk_controls(
+        &self,
+        row: u32,
+        _status: &DiffHunkStatus,
+        hunk_range: Range<editor::Anchor>,
+        is_created_file: bool,
+        line_height: Pixels,
+        editor: &Entity<Editor>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        if !ProjectSettings::get_global(cx)
+            .git
+            .show_stage_restore_buttons
+            || is_created_file
+        {
+            return None;
+        }
+        Some(
+            h_flex()
+                .h(line_height)
+                .items_center()
+                .block_mouse_except_scroll()
+                .child(
+                    IconButton::new(("restore-hunk-left", row as u64), IconName::Undo)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Restore Hunk"))
+                        .on_click({
+                            let editor = editor.clone();
+                            move |_event, window, cx| {
+                                editor.update(cx, |editor, cx| {
+                                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                                    let hunks: Vec<_> = editor
+                                        .diff_hunks_in_ranges(
+                                            std::slice::from_ref(&hunk_range),
+                                            &snapshot,
+                                        )
+                                        .collect();
+                                    if !hunks.is_empty() {
+                                        editor.apply_restore(hunks, window, cx);
+                                    }
+                                });
+                            }
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_hunk_as_staged(&self, _status: &DiffHunkStatus, _cx: &App) -> bool {
         false
     }
@@ -765,5 +814,118 @@ impl Render for UnstagedDiffToolbar {
                     .tooltip(Tooltip::text("Restore All Changes"))
                     .on_click(cx.listener(|this, _, window, cx| this.restore_all(window, cx))),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Modifiers, TestAppContext};
+    use project::FakeFs;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use std::path::Path;
+    use theme::LoadThemes;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    fn init_test(cx: &mut TestAppContext) {
+        zlog::init_test();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_unstaged_diff_left_restore_button(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "line1\nunstaged\nline3\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("file.txt", "line1\nbase\nline3\n".to_string())],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/project/file.txt"), cx)
+            })
+            .await
+            .unwrap();
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        workspace.update_in(cx, |workspace, window, cx| {
+            UnstagedDiff::deploy_at(workspace, None, window, cx);
+        });
+        cx.run_until_parked();
+
+        let unstaged_diff = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_item_as::<UnstagedDiff>(cx)
+            })
+            .expect("unstaged diff should be open");
+        let editor = unstaged_diff.read_with(cx, |diff, cx| {
+            diff.diff.read(cx).editor().read(cx).rhs_editor().clone()
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(
+                editor::SelectionEffects::no_scroll(),
+                window,
+                cx,
+                |selections| {
+                    selections.select_ranges([
+                        language::Point::new(0, 0)..language::Point::new(0, 0),
+                    ]);
+                },
+            );
+        });
+        cx.run_until_parked();
+        cx.refresh().unwrap();
+
+        let button_bounds = cx
+            .debug_bounds("ICON-Undo")
+            .expect("left restore button should be rendered in unstaged diff");
+
+        // Created files should not render the left restore button.
+        let created_button = cx.update(|window, cx| {
+            UnstagedDiffHunkRenderer.render_left_hunk_controls(
+                0,
+                &DiffHunkStatus::added_none(),
+                editor::Anchor::Min..editor::Anchor::Min,
+                true,
+                px(20.),
+                &editor,
+                window,
+                cx,
+            )
+        });
+        assert!(created_button.is_none());
+
+        cx.simulate_click(button_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "line1\nbase\nline3\n"
+        );
+        assert_eq!(editor.read_with(cx, |editor, cx| editor.text(cx)), "");
     }
 }

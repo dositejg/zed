@@ -181,6 +181,31 @@ impl DiffHunkRenderer for SplitLhsDiffHunkRenderer {
         )
     }
 
+    fn render_left_hunk_controls(
+        &self,
+        row: u32,
+        status: &DiffHunkStatus,
+        hunk_range: Range<Anchor>,
+        is_created_file: bool,
+        line_height: Pixels,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        let splittable = self.splittable.upgrade()?;
+        let renderer = splittable.read(cx).rhs_editor.read(cx).diff_hunk_renderer();
+        renderer.render_left_hunk_controls(
+            row,
+            status,
+            hunk_range,
+            is_created_file,
+            line_height,
+            editor,
+            window,
+            cx,
+        )
+    }
+
     fn render_hunk_as_staged(&self, status: &DiffHunkStatus, cx: &App) -> bool {
         let Some(splittable) = self.splittable.upgrade() else {
             return false;

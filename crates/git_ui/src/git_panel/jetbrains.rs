@@ -656,7 +656,7 @@ impl GitPanel {
                 h_flex()
                     .gap_0p5()
                     .child(self.render_jetbrains_commit_history_menu(cx))
-                    .children(self.render_generate_commit_message_button(cx))
+                    .children(self.render_generate_commit_message_button(true, cx))
                     .child(self.render_jetbrains_commit_options_menu(cx))
                     .child(fill_editor_button)
                     .child(toggle_editor_button),
