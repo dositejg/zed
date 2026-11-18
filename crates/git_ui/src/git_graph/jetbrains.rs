@@ -410,6 +410,7 @@ impl JetBrainsGitDock {
 
     fn render_header_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let log_active = self.active_tab == DockTab::Log;
+        let workspace = self.workspace.clone();
 
         h_flex()
             .id("jetbrains-git-dock-header")
@@ -494,6 +495,22 @@ impl JetBrainsGitDock {
                         })),
                     )
             }))
+            .child(div().flex_1())
+            .child(
+                IconButton::new("jetbrains-git-dock-hide", IconName::Dash)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::for_action_title(
+                        "Hide",
+                        &workspace::ToggleBottomDock,
+                    ))
+                    .on_click(move |_, window, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.toggle_dock(DockPosition::Bottom, window, cx);
+                            })
+                            .ok();
+                    }),
+            )
     }
 }
 
@@ -3667,6 +3684,19 @@ mod tests {
         dock.read_with(cx, |dock, _| {
             assert!(dock.history_tabs.is_empty());
             assert_eq!(dock.active_tab, DockTab::Log);
+        });
+
+        // Clicking the hide button collapses the bottom dock.
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.bottom_dock().read(cx).is_open());
+        });
+        cx.refresh().unwrap();
+        let hide_bounds = cx
+            .debug_bounds("ICON-Dash")
+            .expect("hide button should be rendered");
+        cx.simulate_click(hide_bounds.center(), gpui::Modifiers::none());
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(!workspace.bottom_dock().read(cx).is_open());
         });
     }
 
