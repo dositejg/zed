@@ -1495,7 +1495,9 @@ pub struct GitGraph {
     ref_labels_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     log_source: LogSource,
     log_order: LogOrder,
-    selected_commit_diff: Option<CommitDiff>,
+    // Rc so the JetBrains details pane can tell, by pointer, whether its cached
+    // changed-file entries still belong to the current diff.
+    selected_commit_diff: Option<Rc<CommitDiff>>,
     selected_commit_diff_stats: Option<(usize, usize)>,
     _commit_diff_task: Option<Task<()>>,
     selected_commit_message: Option<DetailPanelCommitMessage>,
@@ -2505,7 +2507,7 @@ impl GitGraph {
             if let Ok(diff) = diff_task.await {
                 this.update(cx, |this, cx| {
                     let stats = compute_diff_stats(&diff);
-                    this.selected_commit_diff = Some(diff);
+                    this.selected_commit_diff = Some(Rc::new(diff));
                     this.selected_commit_diff_stats = Some(stats);
                     cx.notify();
                 })
@@ -8741,7 +8743,7 @@ mod tests {
         cx.run_until_parked();
 
         git_graph.update(cx, |graph, cx| {
-            graph.selected_commit_diff = Some(CommitDiff {
+            graph.selected_commit_diff = Some(Rc::new(CommitDiff {
                 files: vec![CommitFile {
                     path: RepoPath::new("file.txt").expect("repository path should be valid"),
                     old_text: Some("content".into()),
@@ -8749,7 +8751,7 @@ mod tests {
                     is_binary: false,
                 }],
                 is_shallow_boundary: false,
-            });
+            }));
             graph.selected_commit_diff_stats = Some((1, 1));
             cx.notify();
         });

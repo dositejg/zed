@@ -126,6 +126,72 @@ pub(crate) struct JetBrainsGraphState {
     pub(crate) paths_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub(crate) sort_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub(super) details_split_state: Entity<SplitState>,
+    branch_pane_cache: Option<BranchPaneCache>,
+    changed_files_cache: Option<ChangedFilesCache>,
+}
+
+// Every hover or click in the dock re-renders `GitGraph`, so the derived data
+// below is cached and rebuilt only when its inputs change.
+struct BranchPaneCache {
+    filter_text: String,
+    branches: Vec<Branch>,
+    commit_count: usize,
+    first_commit: Option<Rc<CommitEntry>>,
+    last_commit: Option<Rc<CommitEntry>>,
+    local_tree: Rc<BTreeMap<String, BranchTreeNode>>,
+    remote_tree: Rc<BTreeMap<String, BranchTreeNode>>,
+    tags: Rc<Vec<SharedString>>,
+}
+
+impl BranchPaneCache {
+    fn is_valid_for(
+        &self,
+        filter_text: &str,
+        branches: &[Branch],
+        commits: &[Rc<CommitEntry>],
+    ) -> bool {
+        fn same_commit(
+            cached: &Option<Rc<CommitEntry>>,
+            current: Option<&Rc<CommitEntry>>,
+        ) -> bool {
+            match (cached, current) {
+                (Some(cached), Some(current)) => Rc::ptr_eq(cached, current),
+                (None, None) => true,
+                _ => false,
+            }
+        }
+
+        self.filter_text == filter_text
+            && self.branches == branches
+            && self.commit_count == commits.len()
+            && same_commit(&self.first_commit, commits.first())
+            && same_commit(&self.last_commit, commits.last())
+    }
+}
+
+struct ChangedFilesCache {
+    diff: Option<Rc<CommitDiff>>,
+    view_mode: ChangedFilesViewMode,
+    expanded_dirs: HashMap<RepoPath, bool>,
+    entries: Rc<Vec<ChangedFileEntry>>,
+    tree_entries: Rc<Vec<ChangedFileTreeEntry>>,
+    dir_paths: Rc<Vec<RepoPath>>,
+}
+
+impl ChangedFilesCache {
+    fn is_valid_for(
+        &self,
+        diff: Option<&Rc<CommitDiff>>,
+        view_mode: ChangedFilesViewMode,
+        expanded_dirs: &HashMap<RepoPath, bool>,
+    ) -> bool {
+        let same_diff = match (&self.diff, diff) {
+            (Some(cached), Some(current)) => Rc::ptr_eq(cached, current),
+            (None, None) => true,
+            _ => false,
+        };
+        same_diff && self.view_mode == view_mode && &self.expanded_dirs == expanded_dirs
+    }
 }
 
 impl JetBrainsGraphState {
@@ -168,6 +234,8 @@ impl JetBrainsGraphState {
             paths_menu_handle: PopoverMenuHandle::default(),
             sort_menu_handle: PopoverMenuHandle::default(),
             details_split_state,
+            branch_pane_cache: None,
+            changed_files_cache: None,
         }
     }
 
@@ -1700,6 +1768,73 @@ impl GitGraph {
         }
     }
 
+    #[allow(clippy::type_complexity)]
+    fn jetbrains_branch_pane_data(
+        &mut self,
+        filter_text: String,
+    ) -> Option<(
+        Rc<BTreeMap<String, BranchTreeNode>>,
+        Rc<BTreeMap<String, BranchTreeNode>>,
+        Rc<Vec<SharedString>>,
+    )> {
+        let commits = &self.graph_data.commits;
+        let jb = self.jetbrains.as_mut()?;
+
+        let is_valid = jb
+            .branch_pane_cache
+            .as_ref()
+            .is_some_and(|cache| cache.is_valid_for(&filter_text, &jb.branches, commits));
+        if !is_valid {
+            let mut local_tree: BTreeMap<String, BranchTreeNode> = BTreeMap::new();
+            let mut remote_tree: BTreeMap<String, BranchTreeNode> = BTreeMap::new();
+
+            for branch in &jb.branches {
+                let name = branch.name().to_string();
+                if !filter_text.is_empty() && !name.to_lowercase().contains(&filter_text) {
+                    continue;
+                }
+                let parts: Vec<&str> = name.split('/').collect();
+                let tree = if branch.is_remote() {
+                    &mut remote_tree
+                } else {
+                    &mut local_tree
+                };
+                insert_branch_into_tree(tree, &parts, String::new(), branch.clone());
+            }
+
+            let mut tags_set = IndexSet::default();
+            for commit in commits {
+                for tag in commit.data.tag_names() {
+                    if filter_text.is_empty() || tag.to_lowercase().contains(&filter_text) {
+                        tags_set.insert(tag);
+                    }
+                }
+            }
+            let tags: Vec<SharedString> = tags_set
+                .into_iter()
+                .map(|tag| SharedString::from(tag.to_string()))
+                .collect();
+
+            jb.branch_pane_cache = Some(BranchPaneCache {
+                filter_text,
+                branches: jb.branches.clone(),
+                commit_count: commits.len(),
+                first_commit: commits.first().cloned(),
+                last_commit: commits.last().cloned(),
+                local_tree: Rc::new(local_tree),
+                remote_tree: Rc::new(remote_tree),
+                tags: Rc::new(tags),
+            });
+        }
+
+        let cache = jb.branch_pane_cache.as_ref()?;
+        Some((
+            cache.local_tree.clone(),
+            cache.remote_tree.clone(),
+            cache.tags.clone(),
+        ))
+    }
+
     fn render_jetbrains_branches_pane(
         &mut self,
         cx: &mut Context<Self>,
@@ -1709,7 +1844,6 @@ impl GitGraph {
         };
 
         let filter_text = jb.branch_filter_editor.read(cx).text(cx).trim().to_lowercase();
-        let branches = jb.branches.clone();
         let collapsed_sections = jb.collapsed_sections.clone();
         let expanded_folders = jb.expanded_branch_folders.clone();
         let branch_filter_editor = jb.branch_filter_editor.clone();
@@ -1723,35 +1857,10 @@ impl GitGraph {
             .map(|b| SharedString::from(b.name().to_string()));
         let head_tracking_status = head_branch.as_ref().and_then(|b| b.tracking_status());
 
-        let mut local_tree: BTreeMap<String, BranchTreeNode> = BTreeMap::new();
-        let mut remote_tree: BTreeMap<String, BranchTreeNode> = BTreeMap::new();
-
-        for branch in branches {
-            let name = branch.name().to_string();
-            if !filter_text.is_empty() && !name.to_lowercase().contains(&filter_text) {
-                continue;
-            }
-            let parts: Vec<&str> = name.split('/').collect();
-            if branch.is_remote() {
-                insert_branch_into_tree(&mut remote_tree, &parts, String::new(), branch);
-            } else {
-                insert_branch_into_tree(&mut local_tree, &parts, String::new(), branch);
-            }
-        }
-
-        let mut tags_set = IndexSet::default();
-        for commit in &self.graph_data.commits {
-            for tag in commit.data.tag_names() {
-                if filter_text.is_empty() || tag.to_lowercase().contains(&filter_text) {
-                    tags_set.insert(tag);
-                }
-            }
-        }
-        let tags: Vec<SharedString> = tags_set
-            .into_iter()
-            .map(|tag| SharedString::from(tag.to_string()))
-            .collect();
-
+        let Some((local_tree, remote_tree, tags)) = self.jetbrains_branch_pane_data(filter_text)
+        else {
+            return Empty.into_any_element();
+        };
         let all_selected = self.log_source == LogSource::All;
         let head_selected = head_branch_name
             .as_ref()
@@ -2597,8 +2706,74 @@ impl GitGraph {
         authors.into_iter().collect()
     }
 
+    #[allow(clippy::type_complexity)]
+    fn jetbrains_changed_files_data(
+        &mut self,
+        cx: &App,
+    ) -> (
+        Rc<Vec<ChangedFileEntry>>,
+        Rc<Vec<ChangedFileTreeEntry>>,
+        Rc<Vec<RepoPath>>,
+    ) {
+        let Some(jb) = self.jetbrains.as_mut() else {
+            return (Rc::default(), Rc::default(), Rc::default());
+        };
+        let diff = self.selected_commit_diff.as_ref();
+        let view_mode = self.changed_files_view_mode;
+        let expanded_dirs = &self.changed_files_expanded_dirs;
+
+        let is_valid = jb
+            .changed_files_cache
+            .as_ref()
+            .is_some_and(|cache| cache.is_valid_for(diff, view_mode, expanded_dirs));
+        if !is_valid {
+            let entries: Vec<ChangedFileEntry> = diff
+                .map(|diff| {
+                    let mut files = diff.files.iter().collect::<Vec<_>>();
+                    if !view_mode.is_tree() {
+                        files.sort_by_key(|file| file.status());
+                    }
+                    files
+                        .into_iter()
+                        .map(|file| ChangedFileEntry::from_commit_file(file, cx))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let tree_entries: Vec<ChangedFileTreeEntry> = if view_mode.is_tree() {
+                build_changed_file_tree_entries(entries.clone(), expanded_dirs)
+            } else {
+                Vec::new()
+            };
+            let dir_paths: Vec<RepoPath> = tree_entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    ChangedFileTreeEntry::Directory(dir) => Some(dir.path.clone()),
+                    ChangedFileTreeEntry::File(_) => None,
+                })
+                .collect();
+
+            jb.changed_files_cache = Some(ChangedFilesCache {
+                diff: diff.cloned(),
+                view_mode,
+                expanded_dirs: expanded_dirs.clone(),
+                entries: Rc::new(entries),
+                tree_entries: Rc::new(tree_entries),
+                dir_paths: Rc::new(dir_paths),
+            });
+        }
+
+        match jb.changed_files_cache.as_ref() {
+            Some(cache) => (
+                cache.entries.clone(),
+                cache.tree_entries.clone(),
+                cache.dir_paths.clone(),
+            ),
+            None => (Rc::default(), Rc::default(), Rc::default()),
+        }
+    }
+
     fn render_jetbrains_right_pane(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2613,7 +2788,7 @@ impl GitGraph {
                 .into_any_element();
         };
 
-        let Some(commit_entry) = self.graph_data.commits.get(selected_idx) else {
+        let Some(commit_entry) = self.graph_data.commits.get(selected_idx).cloned() else {
             return v_flex()
                 .id("jetbrains-details-placeholder")
                 .size_full()
@@ -2698,39 +2873,9 @@ impl GitGraph {
         let (total_lines_added, total_lines_removed) =
             self.selected_commit_diff_stats.unwrap_or((0, 0));
 
-        let changed_file_entries: Vec<ChangedFileEntry> = self
-            .selected_commit_diff
-            .as_ref()
-            .map(|diff| {
-                let mut files = diff.files.iter().collect::<Vec<_>>();
-                if !self.changed_files_view_mode.is_tree() {
-                    files.sort_by_key(|file| file.status());
-                }
-                files
-                    .into_iter()
-                    .map(|file| ChangedFileEntry::from_commit_file(file, cx))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let changed_file_entries = Rc::new(changed_file_entries);
+        let (changed_file_entries, tree_entries, all_dir_paths) =
+            self.jetbrains_changed_files_data(cx);
         let is_tree_view = self.changed_files_view_mode.is_tree();
-        let tree_entries: Rc<Vec<ChangedFileTreeEntry>> = if is_tree_view {
-            Rc::new(build_changed_file_tree_entries(
-                changed_file_entries.as_ref().clone(),
-                &self.changed_files_expanded_dirs,
-            ))
-        } else {
-            Rc::default()
-        };
-
-        let all_dir_paths: Vec<RepoPath> = tree_entries
-            .iter()
-            .filter_map(|entry| match entry {
-                ChangedFileTreeEntry::Directory(dir) => Some(dir.path.clone()),
-                ChangedFileTreeEntry::File(_) => None,
-            })
-            .collect();
-
         let copied_state: Entity<CopiedState> =
             window.use_keyed_state("jb-sha-copy", cx, CopiedState::new);
         let is_copied = copied_state.read(cx).is_copied();
@@ -2805,7 +2950,7 @@ impl GitGraph {
                                             .icon_size(IconSize::XSmall)
                                             .tooltip(Tooltip::text("Expand All"))
                                             .on_click(cx.listener(move |this, _, _, cx| {
-                                                for dir in &dirs_for_expand {
+                                                for dir in dirs_for_expand.iter() {
                                                     this.changed_files_expanded_dirs
                                                         .insert(dir.clone(), true);
                                                 }
@@ -3865,6 +4010,114 @@ mod tests {
                 assert_eq!(graph.jetbrains_visible_commit_count(cx), 1);
                 assert_eq!(graph.jetbrains_commit_index(0), 1);
             });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_jetbrains_render_caches_reuse_and_invalidate(cx: &mut TestAppContext) {
+        init_test(cx);
+        set_layout(GitPanelLayout::Jetbrains, cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/project"), json!({ ".git": {}, "a.txt": "hello" }))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let git_store = project.read_with(cx, |p, _| p.git_store().clone());
+        let repo = git_store
+            .read_with(cx, |store, _| store.active_repository())
+            .expect("active repository");
+        let repo_id = repo.read_with(cx, |r, _| r.id);
+
+        let branch = |ref_name: &str| Branch {
+            is_head: false,
+            ref_name: ref_name.to_string().into(),
+            upstream: None,
+            most_recent_commit: None,
+        };
+
+        let graph = cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                cx.new(|cx| {
+                    let mut graph = GitGraph::new_jetbrains(
+                        repo_id,
+                        git_store,
+                        workspace.weak_handle(),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                    if let Some(jb) = &mut graph.jetbrains {
+                        jb.branches = vec![
+                            branch("refs/heads/main"),
+                            branch("refs/heads/feature/one"),
+                            branch("refs/remotes/origin/main"),
+                        ];
+                    }
+                    graph
+                })
+            })
+        });
+
+        graph.update(cx, |graph, cx| {
+            let (local, remote, _) = graph
+                .jetbrains_branch_pane_data(String::new())
+                .expect("branch pane data");
+            let (local_again, remote_again, _) = graph
+                .jetbrains_branch_pane_data(String::new())
+                .expect("branch pane data");
+            assert!(Rc::ptr_eq(&local, &local_again));
+            assert!(Rc::ptr_eq(&remote, &remote_again));
+            assert_eq!(local.len(), 2);
+            assert_eq!(remote.len(), 1);
+
+            let (filtered_local, filtered_remote, _) = graph
+                .jetbrains_branch_pane_data("feature".to_string())
+                .expect("branch pane data");
+            assert!(!Rc::ptr_eq(&local, &filtered_local));
+            assert_eq!(filtered_local.len(), 1);
+            assert!(filtered_remote.is_empty());
+
+            if let Some(jb) = &mut graph.jetbrains {
+                jb.branches.push(branch("refs/heads/fix"));
+            }
+            let (rebuilt_local, _, _) = graph
+                .jetbrains_branch_pane_data(String::new())
+                .expect("branch pane data");
+            assert_eq!(rebuilt_local.len(), 3);
+
+            let diff = |path: &str| {
+                Rc::new(CommitDiff {
+                    files: vec![CommitFile {
+                        path: RepoPath::new(path).expect("repository path should be valid"),
+                        old_text: Some("old".into()),
+                        new_text: Some("new".into()),
+                        is_binary: false,
+                    }],
+                    is_shallow_boundary: false,
+                })
+            };
+
+            graph.selected_commit_diff = Some(diff("dir/a.txt"));
+            let (entries, _, _) = graph.jetbrains_changed_files_data(cx);
+            let (entries_again, _, _) = graph.jetbrains_changed_files_data(cx);
+            assert!(Rc::ptr_eq(&entries, &entries_again));
+            assert_eq!(entries.len(), 1);
+
+            graph.changed_files_view_mode = graph.changed_files_view_mode.toggled();
+            let (toggled_entries, _, _) = graph.jetbrains_changed_files_data(cx);
+            assert!(!Rc::ptr_eq(&entries, &toggled_entries));
+
+            graph.selected_commit_diff = Some(diff("dir/b.txt"));
+            let (new_entries, _, _) = graph.jetbrains_changed_files_data(cx);
+            assert!(!Rc::ptr_eq(&toggled_entries, &new_entries));
+
+            graph.selected_commit_diff = None;
+            let (cleared_entries, _, _) = graph.jetbrains_changed_files_data(cx);
+            assert!(cleared_entries.is_empty());
         });
     }
 
