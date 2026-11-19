@@ -129,21 +129,43 @@ impl TextFinder {
         _window: Option<&mut Window>,
         _: &mut Context<Workspace>,
     ) {
-        pub use zed_actions::text_finder::Toggle;
-        workspace.register_action(|workspace, _: &Toggle, window, cx| {
-            let Some(text_picker) = workspace.active_modal::<Self>(cx) else {
-                let seed_query = Self::seed_query(workspace, window, cx);
-                Self::open(seed_query, window, cx).detach();
-                return;
-            };
+        workspace.register_action(
+            |workspace, _: &zed_actions::text_finder::Toggle, window, cx| {
+                Self::toggle(workspace, false, window, cx);
+            },
+        );
+        workspace.register_action(
+            |workspace, _: &zed_actions::search_everywhere::Toggle, window, cx| {
+                Self::toggle(workspace, true, window, cx);
+            },
+        );
+    }
 
-            text_picker.update(cx, |text_picker, cx| {
-                text_picker.init_modifiers = Some(window.modifiers());
-                text_picker.picker.update(cx, |picker, cx| {
-                    picker.cycle_selection(window, cx);
+    fn toggle(
+        workspace: &mut Workspace,
+        include_files: bool,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        if let Some(text_picker) = workspace.active_modal::<Self>(cx) {
+            let is_same_mode =
+                text_picker.read(cx).picker.read(cx).delegate.include_files == include_files;
+            if is_same_mode {
+                text_picker.update(cx, |text_picker, cx| {
+                    text_picker.init_modifiers = Some(window.modifiers());
+                    text_picker.picker.update(cx, |picker, cx| {
+                        picker.cycle_selection(window, cx);
+                    });
                 });
-            })
-        });
+                return;
+            }
+            // `toggle_modal` would only close a finder of the same type, so switching between
+            // the text-only and the search-everywhere mode has to close the current one first.
+            workspace.hide_modal(window, cx);
+        }
+
+        let seed_query = Self::seed_query(workspace, window, cx);
+        Self::open(seed_query, include_files, window, cx).detach();
     }
 
     pub fn open_from_project_search<T: 'static>(
@@ -394,6 +416,7 @@ impl TextFinder {
 
     pub(crate) fn open(
         seed_query: Option<SearchSeed>,
+        include_files: bool,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Task<()> {
@@ -404,7 +427,8 @@ impl TextFinder {
                 return;
             };
 
-            let delegate = delegate_task.await;
+            let mut delegate = delegate_task.await;
+            delegate.include_files = include_files;
             workspace
                 .update_in(cx, |workspace, window, cx| {
                     let workspace_id = workspace.database_id();
@@ -545,7 +569,7 @@ mod tests {
     use util::path;
     use workspace::MultiWorkspace;
 
-    use super::delegate::toggle_search_option;
+    use super::delegate::{Entry, toggle_search_option};
     use super::*;
 
     fn init_test(cx: &mut TestAppContext) {
@@ -587,7 +611,7 @@ mod tests {
         };
         workspace
             .update_in(cx, |_, window, cx| {
-                TextFinder::open(Some(seed_query), window, cx)
+                TextFinder::open(Some(seed_query), false, window, cx)
             })
             .await;
 
@@ -633,7 +657,7 @@ mod tests {
         };
         workspace
             .update_in(cx, |_, window, cx| {
-                TextFinder::open(Some(seed_query), window, cx)
+                TextFinder::open(Some(seed_query), false, window, cx)
             })
             .await;
         workspace.update_in(cx, |workspace, window, cx| {
@@ -649,7 +673,9 @@ mod tests {
             Some(QuerySeed::Query(query)) if query == initial_query
         ));
         workspace
-            .update_in(cx, |_, window, cx| TextFinder::open(seed_query, window, cx))
+            .update_in(cx, |_, window, cx| {
+                TextFinder::open(seed_query, false, window, cx)
+            })
             .await;
 
         let picker = workspace.update(cx, |workspace, cx| {
@@ -711,7 +737,7 @@ mod tests {
         });
         workspace
             .update_in(cx, |_, window, cx| {
-                TextFinder::open(Some(seed_query), window, cx)
+                TextFinder::open(Some(seed_query), false, window, cx)
             })
             .await;
         cx.run_until_parked();
@@ -744,6 +770,128 @@ mod tests {
                 None,
                 "highlighting should be dropped once the regex filter is off"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_search_everywhere_lists_files_before_text(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "needle.rs": "fn main() {}",
+                "other.rs": "// needle in a haystack",
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let seed_query = SearchSeed {
+            query: QuerySeed::Query("needle".to_string()),
+            options: None,
+        };
+        workspace
+            .update_in(cx, |_, window, cx| {
+                TextFinder::open(Some(seed_query), true, window, cx)
+            })
+            .await;
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+
+        let picker = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<TextFinder>(cx)
+                .expect("search everywhere should be open")
+                .read(cx)
+                .picker
+                .clone()
+        });
+        picker.read_with(cx, |picker, _| {
+            let delegate = &picker.delegate;
+            let file_paths = delegate
+                .file_matches
+                .iter()
+                .map(|file_match| file_match.path.path.as_unix_str().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(file_paths, vec!["needle.rs".to_string()]);
+            assert_eq!(delegate.matches.len(), 1);
+            assert_eq!(delegate.matches[0].path.path.as_unix_str(), "other.rs");
+            assert!(matches!(
+                delegate.entries.first(),
+                Some(Entry::SectionHeader(_))
+            ));
+            assert!(
+                matches!(
+                    delegate.entries.get(delegate.selected_index),
+                    Some(Entry::File(0))
+                ),
+                "the first file match should be selected"
+            );
+        });
+
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(workspace.active_modal::<TextFinder>(cx).is_none());
+            let active_path = workspace
+                .active_item(cx)
+                .and_then(|item| item.project_path(cx))
+                .expect("confirming a file match should open it");
+            assert_eq!(active_path.path.as_unix_str(), "needle.rs");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_text_finder_lists_no_files(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/dir"), json!({"needle.rs": "needle"}))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let seed_query = SearchSeed {
+            query: QuerySeed::Query("needle".to_string()),
+            options: None,
+        };
+        workspace
+            .update_in(cx, |_, window, cx| {
+                TextFinder::open(Some(seed_query), false, window, cx)
+            })
+            .await;
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+
+        let picker = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<TextFinder>(cx)
+                .expect("text finder should be open")
+                .read(cx)
+                .picker
+                .clone()
+        });
+        picker.read_with(cx, |picker, _| {
+            assert!(picker.delegate.file_matches.is_empty());
+            assert_eq!(picker.delegate.matches.len(), 1);
+            assert!(matches!(
+                picker.delegate.entries.first(),
+                Some(Entry::Header(_))
+            ));
         });
     }
 

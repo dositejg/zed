@@ -416,6 +416,18 @@ pub mod text_finder {
     );
 }
 
+pub mod search_everywhere {
+    use gpui::actions;
+
+    actions!(
+        search_everywhere,
+        [
+            /// Opens a picker that searches both file names and file contents.
+            Toggle,
+        ]
+    );
+}
+
 pub mod project_panel {
     use gpui::actions;
 

@@ -1450,11 +1450,11 @@ impl TitleBar {
 
     fn render_search_button(&self) -> impl IntoElement {
         let workspace = self.workspace.clone();
-        IconButton::new("search-files", IconName::MagnifyingGlass)
+        IconButton::new("search-everywhere", IconName::MagnifyingGlass)
             .icon_size(IconSize::Small)
             .tooltip(Tooltip::for_action_title(
-                "Search Files",
-                &workspace::ToggleFileFinder::default(),
+                "Search Everywhere",
+                &zed_actions::search_everywhere::Toggle,
             ))
             .on_click(move |_, window, cx| {
                 if let Some(workspace) = workspace.upgrade() {
@@ -1465,7 +1465,7 @@ impl TitleBar {
                         }
                     });
                 }
-                window.dispatch_action(workspace::ToggleFileFinder::default().boxed_clone(), cx);
+                window.dispatch_action(zed_actions::search_everywhere::Toggle.boxed_clone(), cx);
             })
     }
 }
@@ -1557,7 +1557,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_search_button_dispatches_toggle_file_finder(cx: &mut TestAppContext) {
+    async fn test_search_button_dispatches_search_everywhere(cx: &mut TestAppContext) {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1571,9 +1571,11 @@ mod tests {
         workspace.update(cx, {
             let dispatch_count = dispatch_count.clone();
             move |workspace, _| {
-                workspace.register_action(move |_, _: &workspace::ToggleFileFinder, _, _| {
-                    dispatch_count.fetch_add(1, Ordering::SeqCst);
-                });
+                workspace.register_action(
+                    move |_, _: &zed_actions::search_everywhere::Toggle, _, _| {
+                        dispatch_count.fetch_add(1, Ordering::SeqCst);
+                    },
+                );
             }
         });
         multi_workspace.update(cx, |_, cx| cx.notify());
