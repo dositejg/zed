@@ -38,17 +38,18 @@ use gpui::{
 use gpui::{Entity, FocusHandle, WeakEntity};
 use language::{Buffer, Language, LanguageAwareStyling};
 use picker::{Picker, PickerDelegate};
-use project::{Project, ProjectPath, Search};
+use project::{Project, ProjectPath, Search, WorktreeId};
 use project::{SearchResults, search::SearchQuery, search::SearchResult};
 use settings::Settings;
 use smol::future::yield_now;
 use text::Anchor;
 use theme_settings::ThemeSettings;
 use ui::{
-    Disclosure, Divider, FluentBuilder, ListItem, ListItemSpacing, Toggleable, Tooltip, prelude::*,
-    text_for_keystroke,
+    Checkbox, Disclosure, Divider, FluentBuilder, HighlightedLabel, ListItem, ListItemSpacing,
+    Toggleable, Tooltip, prelude::*, text_for_keystroke,
 };
 use util::ResultExt;
+use util::rel_path::RelPath;
 use workspace::SplitDirection;
 use workspace::Workspace;
 use workspace::item::ItemSettings;
@@ -90,6 +91,18 @@ pub struct Delegate {
     pub(crate) collapsed_paths: HashSet<ProjectPath>,
     pub(crate) query_editor: Option<Entity<Editor>>,
     pub(crate) regex_language: Option<Arc<Language>>,
+    /// Search Everywhere mode: file name matches are listed above the text matches.
+    pub(crate) include_files: bool,
+    pub(crate) file_matches: Vec<FileMatch>,
+    file_search_task: Option<Task<()>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FileMatch {
+    pub(crate) path: ProjectPath,
+    path_prefix: Arc<RelPath>,
+    /// Byte positions of the matched characters in `path_prefix.join(path)`.
+    positions: Vec<usize>,
 }
 
 /// Wrapper with Eq is path + range equality
@@ -111,6 +124,8 @@ impl PartialEq<SearchMatch> for SelectedMatch {
 }
 
 pub(crate) enum Entry {
+    SectionHeader(SharedString),
+    File(usize),
     Header(ProjectPath),
     Match(usize),
     Separator,
@@ -331,6 +346,9 @@ impl Delegate {
                 collapsed_paths: HashSet::default(),
                 query_editor: None,
                 regex_language: None,
+                include_files: false,
+                file_matches: Vec::new(),
+                file_search_task: None,
             });
 
             this
@@ -372,8 +390,26 @@ impl Delegate {
             Some(Entry::Match(match_index)) => Some(*match_index),
             _ => None,
         };
+        // File matches are re-indexed on every query, so track the selected file by path.
+        let previously_selected_file = match self.entries.get(self.selected_index) {
+            Some(Entry::File(file_index)) => self
+                .file_matches
+                .get(*file_index)
+                .map(|file_match| file_match.path.clone()),
+            _ => None,
+        };
 
-        let mut entries = Vec::with_capacity(self.matches.len());
+        let mut entries = Vec::with_capacity(self.file_matches.len() + self.matches.len() + 2);
+        let show_sections = self.include_files && !self.file_matches.is_empty();
+        if show_sections {
+            entries.push(Entry::SectionHeader("Files".into()));
+            entries.extend((0..self.file_matches.len()).map(Entry::File));
+            if !self.matches.is_empty() {
+                entries.push(Entry::Separator);
+                entries.push(Entry::SectionHeader("Text".into()));
+            }
+        }
+
         let mut last_path: Option<&ProjectPath> = None;
         for (match_index, search_match) in self.matches.iter().enumerate() {
             if last_path != Some(&search_match.path) {
@@ -401,6 +437,16 @@ impl Delegate {
                     .iter()
                     .position(|entry| matches!(entry, Entry::Match(other) if *other == match_index))
             })
+            .or_else(|| {
+                let path = previously_selected_file?;
+                self.entries.iter().position(|entry| match entry {
+                    Entry::File(file_index) => self
+                        .file_matches
+                        .get(*file_index)
+                        .is_some_and(|file_match| file_match.path == path),
+                    _ => false,
+                })
+            })
             .or_else(|| self.first_selectable_index())
             .unwrap_or(0);
     }
@@ -408,7 +454,7 @@ impl Delegate {
     fn first_selectable_index(&self) -> Option<usize> {
         self.entries
             .iter()
-            .position(|entry| matches!(entry, Entry::Match(_)))
+            .position(|entry| matches!(entry, Entry::Match(_) | Entry::File(_)))
     }
 
     pub(crate) fn toggle_group_collapsed(&mut self, path: &ProjectPath) {
@@ -429,7 +475,7 @@ impl Delegate {
                 .get(*match_index)
                 .map(|search_match| search_match.path.clone()),
             Some(Entry::Header(path)) => Some(path.clone()),
-            Some(Entry::Separator) | None => None,
+            Some(Entry::Separator | Entry::SectionHeader(_) | Entry::File(_)) | None => None,
         };
         let Some(path) = path else {
             return;
@@ -449,7 +495,7 @@ impl Delegate {
                         .get(*match_index)
                         .is_some_and(|search_match| search_match.path == path)
             }
-            Entry::Separator => false,
+            Entry::Separator | Entry::SectionHeader(_) | Entry::File(_) => false,
         }) {
             self.selected_index = index;
         }
@@ -477,8 +523,106 @@ impl Delegate {
     fn search_match_for_entry(&self, ix: usize) -> Option<&SearchMatch> {
         match self.entries.get(ix)? {
             Entry::Match(match_index) => self.matches.get(*match_index),
-            Entry::Header(_) | Entry::Separator => None,
+            Entry::Header(_) | Entry::Separator | Entry::SectionHeader(_) | Entry::File(_) => None,
         }
+    }
+
+    fn selected_file_match(&self) -> Option<&FileMatch> {
+        match self.entries.get(self.selected_index)? {
+            Entry::File(file_index) => self.file_matches.get(*file_index),
+            _ => None,
+        }
+    }
+
+    fn spawn_file_search(
+        &mut self,
+        query: &str,
+        cancel_flag: Arc<AtomicBool>,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        if !self.include_files || query.is_empty() {
+            self.file_matches.clear();
+            self.file_search_task = None;
+            return;
+        }
+
+        let worktree_store = self.project(cx).read(cx).worktree_store();
+        let worktrees = worktree_store
+            .read(cx)
+            .visible_worktrees_and_single_files(cx)
+            .collect::<Vec<_>>();
+        let include_root_name = !should_hide_root_in_entry_path(&worktree_store, cx);
+        let include_ignored = self.search_options.contains(SearchOptions::INCLUDE_IGNORED);
+        let candidate_sets = worktrees
+            .into_iter()
+            .map(|worktree| {
+                let worktree = worktree.read(cx);
+                project::PathMatchCandidateSet {
+                    snapshot: worktree.snapshot(),
+                    include_ignored: include_ignored
+                        || worktree.root_entry().is_some_and(|entry| entry.is_ignored),
+                    include_root_name,
+                    candidates: project::Candidates::Files,
+                }
+            })
+            .collect::<Vec<_>>();
+        let query = query.to_owned();
+
+        self.file_search_task = Some(cx.spawn_in(window, async move |picker, cx| {
+            let path_matches = fuzzy_nucleo::match_path_sets(
+                candidate_sets.as_slice(),
+                &query,
+                &None,
+                fuzzy_nucleo::PathMatchOptions {
+                    max_results: fuzzy_nucleo::MaxResults::limit::<MAX_FILE_MATCHES>(),
+                    cancel_flag: Some(&cancel_flag),
+                    ..Default::default()
+                },
+                cx.background_executor().clone(),
+            )
+            .await;
+            if cancel_flag.load(Ordering::Acquire) {
+                return;
+            }
+            picker
+                .update(cx, |picker, cx| {
+                    let delegate = &mut picker.delegate;
+                    delegate.file_matches = path_matches
+                        .into_iter()
+                        .map(|path_match| FileMatch {
+                            path: ProjectPath {
+                                worktree_id: WorktreeId::from_usize(path_match.worktree_id),
+                                path: path_match.path,
+                            },
+                            path_prefix: path_match.path_prefix,
+                            positions: path_match.positions,
+                        })
+                        .collect();
+                    delegate.rebuild_entries();
+                    cx.notify();
+                })
+                .log_err();
+        }));
+    }
+
+    fn open_file(
+        &self,
+        path: ProjectPath,
+        split_direction: Option<SplitDirection>,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        let Some(workspace) = self.project_search_view.read(cx).workspace.upgrade() else {
+            return;
+        };
+        let open_task = workspace.update(cx, |workspace, cx| match split_direction {
+            Some(direction) => {
+                workspace.split_path_preview(path, false, Some(direction), window, cx)
+            }
+            None => workspace.open_path_preview(path, None, true, false, true, window, cx),
+        });
+        open_task.detach_and_log_err(cx);
     }
 
     pub(crate) fn prepend_selected_matches(&mut self) {
@@ -562,6 +706,11 @@ impl Delegate {
                     cx,
                 );
             }
+            cx.emit(DismissEvent);
+            return;
+        }
+        if let Some(file_match) = self.selected_file_match() {
+            self.open_file(file_match.path.clone(), Some(direction), window, cx);
             cx.emit(DismissEvent);
             return;
         }
@@ -718,6 +867,29 @@ const CLICK_THRESHOLD: Duration = Duration::from_millis(50);
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(300);
 const SEARCH_RESULTS_BATCH_SIZE: usize = 256;
 const MAX_MATCH_CONTEXT_BYTES: usize = 512;
+const MAX_FILE_MATCHES: usize = 20;
+
+/// Mirrors the file finder: the worktree root name is part of a match's path unless the project
+/// panel hides it and there is only one worktree to tell apart.
+fn should_hide_root_in_entry_path(
+    worktree_store: &Entity<project::worktree_store::WorktreeStore>,
+    cx: &App,
+) -> bool {
+    let multiple_worktrees = worktree_store
+        .read(cx)
+        .visible_worktrees(cx)
+        .filter(|worktree| !worktree.read(cx).is_single_file())
+        .nth(1)
+        .is_some();
+    let hide_root = cx
+        .global::<settings::SettingsStore>()
+        .merged_settings()
+        .project_panel
+        .as_ref()
+        .and_then(|project_panel| project_panel.hide_root)
+        .unwrap_or(false);
+    hide_root && !multiple_worktrees
+}
 
 impl PickerDelegate for Delegate {
     type ListItem = AnyElement;
@@ -727,7 +899,11 @@ impl PickerDelegate for Delegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search all files…".into()
+        if self.include_files {
+            "Search files and text…".into()
+        } else {
+            "Search all files…".into()
+        }
     }
 
     fn searchbar_trailer(
@@ -823,7 +999,8 @@ impl PickerDelegate for Delegate {
         match self.entries.get(ix) {
             Some(Entry::Match(_)) => true,
             Some(Entry::Header(path)) => self.collapsed_paths.contains(path),
-            Some(Entry::Separator) | None => false,
+            Some(Entry::File(_)) => true,
+            Some(Entry::Separator | Entry::SectionHeader(_)) | None => false,
         }
     }
 
@@ -858,6 +1035,7 @@ impl PickerDelegate for Delegate {
         let cancel_flag = Arc::clone(&self.cancel_flag);
         let text_finder_turning_into_project_search =
             Arc::clone(&self.text_finder_turning_into_project_search);
+        self.spawn_file_search(&query, Arc::clone(&cancel_flag), window, cx);
 
         // The picker runs `update_matches("")` once on open. When the text
         // finder was opened from an existing project search, the query editor is
@@ -950,6 +1128,12 @@ impl PickerDelegate for Delegate {
             }
         }
 
+        if let Some(file_match) = self.selected_file_match() {
+            self.open_file(file_match.path.clone(), None, window, cx);
+            cx.emit(DismissEvent);
+            return;
+        }
+
         let Some(selected_match) = self.selected_search_match().cloned() else {
             return;
         };
@@ -1024,7 +1208,14 @@ impl PickerDelegate for Delegate {
         cx.emit(DismissEvent);
     }
 
-    fn try_get_preview_data_for_match(&self, _cx: &App) -> Option<picker::PreviewUpdate> {
+    fn try_get_preview_data_for_match(&self, cx: &App) -> Option<picker::PreviewUpdate> {
+        if let Some(file_match) = self.selected_file_match() {
+            let abs_path = self
+                .project(cx)
+                .read(cx)
+                .absolute_path(&file_match.path, cx)?;
+            return Some(picker::PreviewUpdate::from_path(abs_path));
+        }
         let m = self.selected_search_match()?;
         Some(picker::PreviewUpdate::from_buffer(
             m.buffer.clone(),
@@ -1067,6 +1258,65 @@ impl Delegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Option<AnyElement> {
         match self.entries.get(ix)? {
+            Entry::SectionHeader(title) => Some(
+                div()
+                    .px_2()
+                    .pt_1()
+                    .child(
+                        Label::new(title.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            ),
+            Entry::File(file_index) => {
+                let file_match = self.file_matches.get(*file_index)?;
+                let path_style = self.project(cx).read(cx).path_style(cx);
+                let (file_name, file_name_positions, directory, directory_positions) =
+                    file_match_labels(file_match, path_style);
+                let file_icon = ItemSettings::get_global(cx)
+                    .file_icons
+                    .then(|| FileIcons::get_icon(file_match.path.path.as_std_path(), cx))
+                    .flatten()
+                    .map(|icon| Icon::from_path(icon).color(Color::Muted));
+                // Files can't join a multi-selection; keep the row aligned with the ones that can.
+                let start_slot = match checkbox {
+                    Some(_) => Some(
+                        h_flex()
+                            .gap_1p5()
+                            .child(div().flex_none().size(Checkbox::container_size()))
+                            .children(file_icon)
+                            .into_any_element(),
+                    ),
+                    None => file_icon.map(IntoElement::into_any_element),
+                };
+                Some(
+                    ListItem::new(ix)
+                        .spacing(ListItemSpacing::Sparse)
+                        .inset(true)
+                        .toggle_state(selected)
+                        .start_slot::<AnyElement>(start_slot)
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .gap_1p5()
+                                .child(
+                                    HighlightedLabel::new(file_name, file_name_positions)
+                                        .flex_none()
+                                        .truncate_middle(),
+                                )
+                                .child(
+                                    HighlightedLabel::new(directory, directory_positions)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .flex_1()
+                                        .truncate_start(),
+                                ),
+                        )
+                        .into_any_element(),
+                )
+            }
             Entry::Separator => Some(
                 div()
                     .py(DynamicSpacing::Base04.rems(cx))
@@ -1337,6 +1587,40 @@ fn matched_line_window(
         text::Bias::Right,
     );
     start..end
+}
+
+/// Splits a file match into its file name and directory, each with the matched byte positions
+/// rebased onto that part, the same way the file finder labels its matches.
+fn file_match_labels(
+    file_match: &FileMatch,
+    path_style: util::paths::PathStyle,
+) -> (String, Vec<usize>, String, Vec<usize>) {
+    let full_path = file_match.path_prefix.join(&file_match.path.path);
+    let file_name = full_path.file_name().unwrap_or("");
+    let file_name_start = full_path.as_unix_str().len() - file_name.len();
+    let file_name_positions = file_match
+        .positions
+        .iter()
+        .filter_map(|position| position.checked_sub(file_name_start))
+        .collect();
+
+    let directory = full_path
+        .display(path_style)
+        .trim_end_matches(file_name)
+        .to_string();
+    let directory_positions = file_match
+        .positions
+        .iter()
+        .copied()
+        .filter(|position| *position < directory.len())
+        .collect();
+
+    (
+        file_name.to_string(),
+        file_name_positions,
+        directory,
+        directory_positions,
+    )
 }
 
 /// Renders the matched source line with syntax highlighting, overlaying the
